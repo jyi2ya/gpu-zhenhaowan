@@ -1,9 +1,6 @@
 use anyhow::Result;
-use crossterm::{
-    cursor::MoveToNextLine,
-    execute,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
-};
+use cubecl::Runtime;
+use cubecl::prelude::*;
 use fontdue::{Font, FontSettings};
 use std::fs;
 use tokio::io::AsyncWriteExt;
@@ -11,6 +8,36 @@ use tokio::io::AsyncWriteExt;
 #[inline]
 fn timer(label: &str) -> scope_timer::ScopeTimer {
     scope_timer::ScopeTimer::new(label, scope_timer::TimeFormat::Milliseconds, None, false)
+}
+
+fn pack_rgb(r: u8, g: u8, b: u8) -> u32 {
+    let r = r as u32;
+    let g = g as u32;
+    let b = b as u32;
+    b << 16 | g << 8 | r
+}
+
+fn unpack_rgb(packed: u32) -> (u8, u8, u8) {
+    let b = packed >> 16;
+    let g = (packed >> 8) & 0xff;
+    let r = packed & 0xff;
+    (r as u8, g as u8, b as u8)
+}
+
+#[cfg(test)]
+mod test {
+    use crate::unpack_rgb;
+
+    #[test]
+    fn test_pack_unpack() {
+        let rgb = (12, 33, 86);
+        let mem = [rgb.0, rgb.1, rgb.2, 0];
+        let mem_packed = u32::from_ne_bytes(mem);
+        let packed = super::pack_rgb(rgb.0, rgb.1, rgb.2);
+        assert_eq!(packed, mem_packed);
+        let unpack = super::unpack_rgb(packed);
+        assert_eq!(rgb, unpack);
+    }
 }
 
 fn render_centered(font: &Font, character: char) -> [[u8; 8]; 16] {
@@ -44,7 +71,7 @@ const ASCII_START: u32 = 32;
 const ASCII_END: u32 = 126;
 const ASCII_TABLE_SIZE: u32 = ASCII_END - ASCII_START + 1;
 
-fn generate_ascii_bitmap(font_path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn generate_ascii_bitmap(font_path: &str) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     // 加载字体文件
     let font_data = fs::read(font_path)?;
     let font = Font::from_bytes(font_data, FontSettings::default())?;
@@ -54,9 +81,21 @@ fn generate_ascii_bitmap(font_path: &str) -> Result<Vec<u8>, Box<dyn std::error:
     for c in ASCII_START..=ASCII_END {
         let character = c as u8 as char;
 
-        let bitmap = render_centered(&font, character);
-        result.extend(bitmap.iter().flatten());
-        result.extend(bitmap.iter().flatten().map(|x| 1 - x));
+        let bitmap = render_centered(&font, character)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let mut compressed = Vec::new();
+        for i in 0..4 {
+            let mut bits = 0;
+            for j in 0..32 {
+                let bit = bitmap[i * 32 + j] as u32;
+                bits |= bit << j;
+            }
+            compressed.push(bits);
+        }
+        result.extend(compressed.iter());
+        result.extend(compressed.iter().map(|x| !x));
     }
 
     Ok(result)
@@ -74,17 +113,93 @@ fn cubic_weight(x: f32, a: f32) -> f32 {
     }
 }
 
+#[no_implicit_prelude]
+mod gpu {
+    extern crate cubecl;
+    extern crate std;
+
+    use cubecl::prelude::*;
+    use std::clone::Clone;
+    use std::convert::Into;
+    use std::default::Default;
+
+    #[cube]
+    fn cubic_weight(x: f32, a: f32) -> f32 {
+        let abs_x = f32::abs(x);
+        if abs_x <= 1.0 {
+            (a + 2.0) * abs_x * abs_x * abs_x - (a + 3.0) * abs_x * abs_x + 1.0
+        } else if abs_x < 2.0 {
+            a * abs_x * abs_x * abs_x - 5.0 * a * abs_x * abs_x + 8.0 * a * abs_x - 4.0 * a
+        } else {
+            f32::new(0.0)
+        }
+    }
+
+    #[cube(launch)]
+    pub fn bicubic_resize(
+        dst: &mut Tensor<u8>,
+        src: &Tensor<u8>,
+        #[comptime] dst_width: u32,
+        #[comptime] dst_height: u32,
+        #[comptime] src_width: u32,
+        #[comptime] src_height: u32,
+    ) {
+        let y = ABSOLUTE_POS_Y;
+        let x = ABSOLUTE_POS_X;
+        if y >= dst_height || x >= dst_width {
+            terminate!();
+        }
+
+        let x_ratio = src_width as f32 / dst_width as f32;
+        let y_ratio = src_height as f32 / dst_height as f32;
+
+        let src_x = x as f32 * x_ratio;
+        let src_y = y as f32 * y_ratio;
+
+        let x_floor = src_x as i32;
+        let y_floor = src_y as i32;
+
+        let mut r = 0.0;
+        let mut g = 0.0;
+        let mut b = 0.0;
+        let mut total_weight = 0.0;
+
+        for i in -1..3 {
+            for j in -1..3 {
+                let px = i32::clamp(x_floor + i, 0i32, src_width as i32 - 1) as u32;
+                let py = i32::clamp(y_floor + j, 0i32, src_height as i32 - 1) as u32;
+
+                let idx = (py * src_width + px) * 4;
+                let weight_x = cubic_weight(src_x - (x_floor + i) as f32, -0.5);
+                let weight_y = cubic_weight(src_y - (y_floor + j) as f32, -0.5);
+                let weight = weight_x * weight_y;
+
+                r += src[idx] as f32 * weight;
+                g += src[idx + 1] as f32 * weight;
+                b += src[idx + 2] as f32 * weight;
+                total_weight += weight;
+            }
+        }
+
+        let dst_idx = (y * dst_width + x) * 4;
+        dst[dst_idx] = f32::clamp(r / total_weight, 0.0, 255.0) as u8;
+        dst[dst_idx + 1] = f32::clamp(g / total_weight, 0.0, 255.0) as u8;
+        dst[dst_idx + 2] = f32::clamp(b / total_weight, 0.0, 255.0) as u8;
+        dst[dst_idx + 3] = 255;
+    }
+}
+
 pub fn bicubic_resize(
-    dst: &mut [u8],
+    dst: &mut [u32],
     dst_width: u32,
     dst_height: u32,
-    src: &[u8],
+    src: &[u32],
     src_width: u32,
     src_height: u32,
 ) {
     // 验证输入参数有效性
-    assert!(dst.len() >= (dst_width * dst_height * 3) as usize);
-    assert!(src.len() >= (src_width * src_height * 3) as usize);
+    assert!(dst.len() >= (dst_width * dst_height) as usize);
+    assert!(src.len() >= (src_width * src_height) as usize);
 
     // 计算缩放比例
     let x_ratio = src_width as f32 / dst_width as f32;
@@ -111,30 +226,33 @@ pub fn bicubic_resize(
                     let px = (x_floor + i).clamp(0, src_width as i32 - 1) as u32;
                     let py = (y_floor + j).clamp(0, src_height as i32 - 1) as u32;
 
-                    let idx = (py * src_width + px) as usize * 3;
+                    let idx = (py * src_width + px) as usize;
                     let weight_x = cubic_weight(src_x - (x_floor + i) as f32, -0.5);
                     let weight_y = cubic_weight(src_y - (y_floor + j) as f32, -0.5);
                     let weight = weight_x * weight_y;
+                    let (sr, sg, sb) = unpack_rgb(src[idx]);
 
-                    r += src[idx] as f32 * weight;
-                    g += src[idx + 1] as f32 * weight;
-                    b += src[idx + 2] as f32 * weight;
+                    r += sr as f32 * weight;
+                    g += sg as f32 * weight;
+                    b += sb as f32 * weight;
                     total_weight += weight;
                 }
             }
 
             // 归一化并写入目标图像
-            let dst_idx = (y * dst_width + x) as usize * 3;
-            dst[dst_idx] = (r / total_weight).clamp(0.0, 255.0) as u8;
-            dst[dst_idx + 1] = (g / total_weight).clamp(0.0, 255.0) as u8;
-            dst[dst_idx + 2] = (b / total_weight).clamp(0.0, 255.0) as u8;
+            let dst_idx = (y * dst_width + x) as usize;
+            dst[dst_idx] = pack_rgb(
+                (r / total_weight).clamp(0.0, 255.0) as u8,
+                (g / total_weight).clamp(0.0, 255.0) as u8,
+                (b / total_weight).clamp(0.0, 255.0) as u8,
+            );
         }
     }
 }
 
 fn repack(
-    dst: &mut [u8],
-    src: &[u8],
+    dst: &mut [u32],
+    src: &[u32],
     term_width: u32,
     term_height: u32,
     char_width: u32,
@@ -146,17 +264,12 @@ fn repack(
                 for cw in 0..char_width {
                     let gh = h * char_height + ch;
                     let gw = w * char_width + cw;
-                    let idx_in_start = (gh * (term_width * char_width) + gw) as usize * 3;
-                    let idx_in_end = idx_in_start + 3;
-
-                    let idx_out_start = (h * term_width * char_height * char_width
+                    let idx_in = (gh * (term_width * char_width) + gw) as usize;
+                    let idx_out = (h * term_width * char_height * char_width
                         + w * char_height * char_width
                         + ch * char_width
-                        + cw) as usize
-                        * 3;
-                    let idx_out_end = idx_out_start + 3;
-                    (&mut dst[idx_out_start..idx_out_end])
-                        .copy_from_slice(&src[idx_in_start..idx_in_end]);
+                        + cw) as usize;
+                    dst[idx_out] = src[idx_in];
                 }
             }
         }
@@ -166,7 +279,7 @@ fn repack(
 fn _unpack(
     dst: &mut [u8],
     src: &[u8],
-    palette: &[[[u8; 3]; 2]],
+    palette: &[[[u8; 4]; 2]],
     term_width: u32,
     term_height: u32,
     char_width: u32,
@@ -178,8 +291,8 @@ fn _unpack(
                 for cw in 0..char_width {
                     let gh = h * char_height + ch;
                     let gw = w * char_width + cw;
-                    let idx_in_start = (gh * (term_width * char_width) + gw) as usize * 3;
-                    let idx_in_end = idx_in_start + 3;
+                    let idx_in_start = (gh * (term_width * char_width) + gw) as usize * 4;
+                    let idx_in_end = idx_in_start + 4;
 
                     let block_idx = (h * term_width + w) as usize;
                     let idx_out = (h * term_width * char_height * char_width
@@ -195,10 +308,19 @@ fn _unpack(
     }
 }
 
+fn compute_brightness(dst: &mut [u32], src: &[u32]) {
+    std::iter::zip(dst.iter_mut(), src.iter()).for_each(|(dst, src)| {
+        let (r, g, b) = unpack_rgb(*src);
+        let brightness = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        *dst = brightness as u32;
+    });
+}
+
 fn bimodal_luma_cluster(
-    dst: &mut [u8],
-    palette: &mut [[[u8; 3]; 2]],
-    src: &[u8],
+    dst: &mut [u32],
+    palette: &mut [(u32, u32)],
+    src: &[u32],
+    brightness: &[u32],
     term_width: u32,
     term_height: u32,
     char_width: u32,
@@ -208,93 +330,128 @@ fn bimodal_luma_cluster(
     let image_count = (term_width * term_height) as usize;
 
     assert_eq!(palette.len(), image_count);
-    assert_eq!(dst.len(), image_count * px_per_img);
+    assert_eq!(dst.len(), image_count * 4);
 
-    // 并行处理每张图像
-    let mut idx = 0;
-    std::iter::zip(
-        src.chunks_exact(px_per_img * 3),
-        dst.chunks_exact_mut(px_per_img),
-    )
-    .for_each(|(img, out)| {
-        // 计算每个像素的亮度(考虑alpha)
-        let luma: Vec<_> = img
-            .chunks_exact(3)
-            .map(|px| 0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32)
-            .collect();
+    for h in 0..term_height {
+        for w in 0..term_width {
+            let idx = (h * term_width + w) as usize;
+            let img = &src[idx * px_per_img..(idx + 1) * px_per_img];
+            let out = &mut dst[idx * 4..(idx + 1) * 4];
+            let luma = &brightness[idx * px_per_img..(idx + 1) * px_per_img];
 
-        // 找到亮度中值
-        let mut sorted = luma.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = sorted[sorted.len() / 2];
-
-        // 计算两类颜色的平均值
-        let (mut sum1, mut cnt1, mut sum2, mut cnt2) = ([0u32; 3], 0, [0u32; 3], 0);
-        img.chunks_exact(3).zip(luma.iter()).for_each(|(px, &l)| {
-            if l <= median {
-                sum1.iter_mut().zip(px).for_each(|(s, &p)| *s += p as u32);
-                cnt1 += 1;
-            } else {
-                sum2.iter_mut().zip(px).for_each(|(s, &p)| *s += p as u32);
-                cnt2 += 1;
+            let (mut l, mut r) = (0, 256);
+            while l < r {
+                let m = l + (r - l) / 2;
+                let mut count = 0;
+                for brightness in luma {
+                    if *brightness <= m as u32 {
+                        count += 1;
+                    }
+                }
+                if count <= luma.len() / 2 {
+                    l = m + 1;
+                } else {
+                    r = m;
+                }
             }
-        });
+            let median = l as u32;
 
-        match (cnt1, cnt2) {
-            (0, 0) => unreachable!(),
-            (0, cnt2) => {
-                sum2.iter_mut().for_each(|x| *x /= cnt2);
-                sum1 = sum2;
-            }
-            (cnt1, 0) => {
-                sum1.iter_mut().for_each(|x| *x /= cnt1);
-                sum2 = sum1;
-            }
-            (cnt1, cnt2) => {
-                sum1.iter_mut().for_each(|x| *x /= cnt1);
-                sum2.iter_mut().for_each(|x| *x /= cnt2);
-            }
-        };
-        let sum1 = sum1.into_iter().map(|x| x as u8).collect::<Vec<_>>();
-        let sum2 = sum2.into_iter().map(|x| x as u8).collect::<Vec<_>>();
+            // 计算两类颜色的平均值
+            let (mut sum1, mut cnt1, mut sum2, mut cnt2) = ((0, 0, 0), 0, (0, 0, 0), 0);
+            img.iter().zip(luma.iter()).for_each(|(px, &l)| {
+                let (r, g, b) = unpack_rgb(*px);
+                if l <= median {
+                    sum1.0 += r as u32;
+                    sum1.1 += g as u32;
+                    sum1.2 += b as u32;
+                    cnt1 += 1;
+                } else {
+                    sum2.0 += r as u32;
+                    sum2.1 += g as u32;
+                    sum2.2 += b as u32;
+                    cnt2 += 1;
+                }
+            });
 
-        std::iter::zip(luma.iter(), out.iter_mut()).for_each(|(l, out)| {
-            if *l <= median {
-                *out = 0;
-            } else {
-                *out = 1;
+            match (cnt1, cnt2) {
+                (0, 0) => unreachable!(),
+                (0, cnt2) => {
+                    sum1 = sum2;
+                    cnt1 = cnt2;
+                }
+                (cnt1, 0) => {
+                    sum2 = sum1;
+                    cnt2 = cnt1;
+                }
+                _ => {}
+            };
+
+            sum2.0 /= cnt2;
+            sum2.1 /= cnt2;
+            sum2.2 /= cnt2;
+            sum1.0 /= cnt1;
+            sum1.1 /= cnt1;
+            sum1.2 /= cnt1;
+
+            // let mut tmp = Vec::new();
+            // for i in 0..4 {
+            //     let mut bits = 0u32;
+            //     for j in 0..32 {
+            //         let bit = if luma[i * 32 + j] <= median { 0 } else { 1 };
+            //         bits |= bit << j;
+            //         tmp.push(bit);
+            //     }
+            //     bitset.push(bits);
+            // }
+
+            // let mut idx = 0;
+            // for i in 0..4 {
+            //     for j in 0..32 {
+            //         let bit = (bitset[i] >> j) & 0x1;
+            //         out[idx] = bit as u8;
+            //         out[idx] = tmp[idx] as u8;
+            //         idx += 1;
+            //     }
+            // }
+
+            for i in 0..4 {
+                let mut bits = 0u32;
+                for j in 0..32 {
+                    let bit = if luma[i * 32 + j] <= median { 0 } else { 1 };
+                    bits |= bit << j;
+                }
+                out[i] = bits;
             }
-        });
 
-        palette[idx][0].copy_from_slice(&sum1);
-        palette[idx][1].copy_from_slice(&sum2);
-
-        idx += 1;
-    });
+            palette[idx].0 = pack_rgb(sum1.0 as u8, sum1.1 as u8, sum1.2 as u8);
+            palette[idx].1 = pack_rgb(sum2.0 as u8, sum2.1 as u8, sum2.2 as u8);
+        }
+    }
 }
 
 fn calc_similarity(
-    dst: &mut [u8],
-    src: &[u8],
-    glyph: &[u8],
+    dst: &mut [u32],
+    src: &[u32],
+    glyph: &[u32],
     term_width: u32,
     term_height: u32,
     char_width: u32,
     char_height: u32,
 ) {
     let mut idx = 0;
-    let block_size = (char_width * char_height) as usize;
-    src.chunks_exact(block_size).for_each(|block| {
-        glyph.chunks_exact(block_size).for_each(|glyph| {
-            dst[idx] = std::iter::zip(block, glyph)
-                .filter(|(block, glyph)| block == glyph)
-                .count() as u8;
+    src.chunks_exact(4).for_each(|block| {
+        glyph.chunks_exact(4).for_each(|glyph| {
+            let mut count = 0;
+            for i in 0..4 {
+                count += (block[i] ^ glyph[i]).count_zeros() as u32;
+            }
+            dst[idx] = count;
             idx += 1;
         })
     });
 }
 
-fn get_ascii_string(dst: &mut [u8], src: &[u8]) {
+fn get_ascii_string(dst: &mut [u32], src: &[u32]) {
     let mut idx = 0;
     src.chunks_exact(ASCII_TABLE_SIZE as usize * 2)
         .for_each(|similarity| {
@@ -304,13 +461,13 @@ fn get_ascii_string(dst: &mut [u8], src: &[u8]) {
                 .max_by_key(|(_idx, sim)| **sim)
                 .unwrap()
                 .0;
-            dst[idx] = max as u8;
+            dst[idx] = max as u32;
             idx += 1;
         });
 }
 
 struct VideoFrame {
-    pub data: Vec<u8>,
+    pub data: Vec<u32>,
     pub width: u32,
     pub height: u32,
 }
@@ -338,7 +495,7 @@ fn open_stream(video_path: &str) -> tokio::sync::mpsc::Receiver<VideoFrame> {
             decoder.format(),
             decoder.width(),
             decoder.height(),
-            ffmpeg_next::format::Pixel::RGB24,
+            ffmpeg_next::format::Pixel::RGBA,
             decoder.width(),
             decoder.height(),
             Flags::BICUBIC,
@@ -353,7 +510,11 @@ fn open_stream(video_path: &str) -> tokio::sync::mpsc::Receiver<VideoFrame> {
                 decoder.send_packet(&packet).unwrap();
                 while decoder.receive_frame(&mut frame).is_ok() {
                     scaler.run(&frame, &mut rgb_frame).unwrap();
-                    let rgb_data = rgb_frame.data(0).to_vec();
+                    let rgb_data = rgb_frame
+                        .data(0)
+                        .chunks_exact(4)
+                        .map(|chunk| pack_rgb(chunk[0], chunk[1], chunk[2]))
+                        .collect::<Vec<_>>();
 
                     let frame_data = VideoFrame {
                         data: rgb_data,
@@ -372,30 +533,51 @@ fn open_stream(video_path: &str) -> tokio::sync::mpsc::Receiver<VideoFrame> {
     rx
 }
 
-async fn render(
-    data: &[u8],
+fn get_cube_count(shape: [u32; 3], tiling: CubeDim) -> CubeCount {
+    CubeCount::new_3d(
+        shape[0].div_ceil(tiling.x),
+        shape[1].div_ceil(tiling.y),
+        shape[2].div_ceil(tiling.z),
+    )
+}
+
+async fn render<RT: cubecl::prelude::Runtime>(
+    client: &cubecl::client::ComputeClient<RT::Server, RT::Channel>,
+    data: &[u32],
     width: u32,
     height: u32,
     term_width: u32,
     term_height: u32,
     char_width: u32,
     char_height: u32,
-    bitmap_data: &[u8],
-) -> anyhow::Result<(Vec<u8>, Vec<[[u8; 3]; 2]>)> {
-    // assert_eq!(data.len() as u32, width * height * 3);
-    // assert_eq!(width, term_width * char_width);
-    // assert_eq!(height, term_height * char_height);
-    // let (resized, resized_width, resized_height) = (
-    //     data.to_vec(),
-    //     term_width * char_width,
-    //     term_height * char_height,
-    // );
+    bitmap_data: &[u32],
+) -> anyhow::Result<(Vec<u32>, Vec<(u32, u32)>)> {
+    let tiling = CubeDim::new_2d(16, 16);
 
     let (resized, resized_width, resized_height) = {
         // let _t = timer("resize");
         let resized_width = term_width * char_width;
         let resized_height = term_height * char_height;
-        let mut resized = vec![0; (resized_width * resized_height * 3) as usize];
+
+        // let resized = alloc_tensor::<RT, u8>(client, vec![resized_height, resized_width, 3]);
+        // let data = create_tensor::<RT, u8>(client, vec![height, width, 3], data);
+        // let cube_count = get_cube_count([resized_height, resized_width, 1], tiling);
+
+        // gpu::bicubic_resize::launch(
+        //     client,
+        //     cube_count,
+        //     tiling,
+        //     resized.as_arg(1),
+        //     data.as_arg(1),
+        //     resized_width,
+        //     resized_height,
+        //     width,
+        //     height,
+        // );
+        // let resized = client.read_one_async(resized.handle.binding()).await;
+        // (resized, resized_width, resized_height)
+
+        let mut resized = vec![0; (resized_width * resized_height * 4) as usize];
         bicubic_resize(
             &mut resized,
             resized_width,
@@ -411,7 +593,7 @@ async fn render(
         // let _t = timer("repack");
         let repacked_width = resized_width;
         let repacked_height = resized_height;
-        let mut repacked = vec![0; (repacked_width * repacked_height * 3) as usize];
+        let mut repacked = vec![0; (repacked_width * repacked_height * 4) as usize];
         repack(
             &mut repacked,
             &resized,
@@ -427,12 +609,16 @@ async fn render(
         // let _t = timer("cluster");
         let clustered_width = resized_width;
         let clustered_height = resized_height;
-        let mut clustered = vec![0; (clustered_width * clustered_height) as usize];
-        let mut palette = vec![[[0; 3]; 2]; (term_width * term_height) as usize];
+        let mut clustered = vec![0; (term_width * term_height * 4) as usize];
+        let mut palette = vec![(0, 0); (term_width * term_height) as usize];
+        let mut brightness = vec![0; (resized_width * resized_height) as usize];
+        compute_brightness(&mut brightness, &repacked);
+
         bimodal_luma_cluster(
             &mut clustered,
             &mut palette,
             &repacked,
+            &brightness,
             term_width,
             term_height,
             char_width,
@@ -466,7 +652,7 @@ async fn render(
     Ok((term, palette))
 }
 
-async fn screen(term: Vec<u8>, palette: Vec<[[u8; 3]; 2]>, term_width: u32, term_height: u32) {
+async fn screen(term: Vec<u32>, palette: Vec<(u32, u32)>, term_width: u32, term_height: u32) {
     let mut output = String::with_capacity((term_width * term_height * 20) as usize);
     let mut idx = 0;
 
@@ -474,21 +660,20 @@ async fn screen(term: Vec<u8>, palette: Vec<[[u8; 3]; 2]>, term_width: u32, term
 
     for line in 0..term_height {
         for row in 0..term_width {
-            let fg_color = palette[(line * term_width + row) as usize][(term[idx] % 2) as usize];
-            let bg_color =
-                palette[(line * term_width + row) as usize][(1 - term[idx] % 2) as usize];
-            let chr = char::from((term[idx] / 2) + ASCII_START as u8);
+            let (fg_color, bg_color) = if term[idx] % 2 == 0 {
+                (palette[idx].0, palette[idx].1)
+            } else {
+                (palette[idx].1, palette[idx].0)
+            };
+            let chr = char::from(((term[idx] / 2) + ASCII_START) as u8);
+
+            let (fr, fg, fb) = unpack_rgb(fg_color);
+            let (br, bg, bb) = unpack_rgb(bg_color);
 
             output.push_str(
                 format!(
                     "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m{}",
-                    fg_color[0],
-                    fg_color[1],
-                    fg_color[2],
-                    bg_color[0],
-                    bg_color[1],
-                    bg_color[2],
-                    chr
+                    fr, fg, fb, br, bg, bb, chr
                 )
                 .as_str(),
             );
@@ -527,7 +712,8 @@ async fn main() -> anyhow::Result<()> {
             let now = std::time::Instant::now();
             let duration = (now - start).as_secs();
             let f = frames.load(std::sync::atomic::Ordering::Acquire);
-            if rx.is_empty() {
+            let magic = true;
+            if rx.is_empty() || magic {
                 screen(term, palette, term_width, term_height).await;
                 tokio::io::stdout()
                     .write_all(
@@ -546,10 +732,13 @@ async fn main() -> anyhow::Result<()> {
 
     let mut stream = open_stream(&file);
     let bitmap_data = std::sync::Arc::new(bitmap_data);
+    let client = std::sync::Arc::new(cubecl::wgpu::WgpuRuntime::client(&Default::default()));
     while let Some(frame) = stream.recv().await {
         let bitmap_data = std::sync::Arc::clone(&bitmap_data);
+        let client = std::sync::Arc::clone(&client);
         let handle = tokio::task::spawn(async move {
-            render(
+            render::<cubecl::wgpu::WgpuRuntime>(
+                &client,
                 &frame.data,
                 frame.width,
                 frame.height,
