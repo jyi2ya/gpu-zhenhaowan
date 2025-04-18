@@ -124,6 +124,22 @@ mod gpu {
     use std::default::Default;
 
     #[cube]
+    fn pack_rgb(r: u32, g: u32, b: u32) -> u32 {
+        let r = r;
+        let g = g;
+        let b = b;
+        b << 16 | g << 8 | r
+    }
+
+    #[cube]
+    fn unpack_rgb(packed: u32) -> (u32, u32, u32) {
+        let b = packed >> 16;
+        let g = (packed >> 8) & 0xff;
+        let r = packed & 0xff;
+        (r, g, b)
+    }
+
+    #[cube]
     fn cubic_weight(x: f32, a: f32) -> f32 {
         let abs_x = f32::abs(x);
         if abs_x <= 1.0 {
@@ -137,12 +153,12 @@ mod gpu {
 
     #[cube(launch)]
     pub fn bicubic_resize(
-        dst: &mut Tensor<u8>,
-        src: &Tensor<u8>,
-        #[comptime] dst_width: u32,
-        #[comptime] dst_height: u32,
-        #[comptime] src_width: u32,
-        #[comptime] src_height: u32,
+        dst: &mut Array<u32>,
+        src: &Array<u32>,
+        dst_width: u32,
+        dst_height: u32,
+        src_width: u32,
+        src_height: u32,
     ) {
         let y = ABSOLUTE_POS_Y;
         let x = ABSOLUTE_POS_X;
@@ -156,9 +172,10 @@ mod gpu {
         let src_x = x as f32 * x_ratio;
         let src_y = y as f32 * y_ratio;
 
-        let x_floor = src_x as i32;
-        let y_floor = src_y as i32;
+        let x_floor = f32::floor(src_x) as i32;
+        let y_floor = f32::floor(src_y) as i32;
 
+        // 计算16个相邻像素的权重
         let mut r = 0.0;
         let mut g = 0.0;
         let mut b = 0.0;
@@ -166,26 +183,55 @@ mod gpu {
 
         for i in -1..3 {
             for j in -1..3 {
-                let px = i32::clamp(x_floor + i, 0i32, src_width as i32 - 1) as u32;
-                let py = i32::clamp(y_floor + j, 0i32, src_height as i32 - 1) as u32;
+                let px = i32::clamp(x_floor + i, 0, src_width as i32 - 1) as u32;
+                let py = i32::clamp(y_floor + j, 0, src_height as i32 - 1) as u32;
 
-                let idx = (py * src_width + px) * 4;
+                let idx = py * src_width + px;
                 let weight_x = cubic_weight(src_x - (x_floor + i) as f32, -0.5);
                 let weight_y = cubic_weight(src_y - (y_floor + j) as f32, -0.5);
                 let weight = weight_x * weight_y;
+                let (sr, sg, sb) = unpack_rgb(src[idx]);
 
-                r += src[idx] as f32 * weight;
-                g += src[idx + 1] as f32 * weight;
-                b += src[idx + 2] as f32 * weight;
+                r += sr as f32 * weight;
+                g += sg as f32 * weight;
+                b += sb as f32 * weight;
                 total_weight += weight;
             }
         }
 
-        let dst_idx = (y * dst_width + x) * 4;
-        dst[dst_idx] = f32::clamp(r / total_weight, 0.0, 255.0) as u8;
-        dst[dst_idx + 1] = f32::clamp(g / total_weight, 0.0, 255.0) as u8;
-        dst[dst_idx + 2] = f32::clamp(b / total_weight, 0.0, 255.0) as u8;
-        dst[dst_idx + 3] = 255;
+        // 归一化并写入目标图像
+        let dst_idx = y * dst_width + x;
+        dst[dst_idx] = pack_rgb(
+            f32::clamp(r / total_weight, 0.0, 255.0) as u32,
+            f32::clamp(g / total_weight, 0.0, 255.0) as u32,
+            f32::clamp(b / total_weight, 0.0, 255.0) as u32,
+        );
+    }
+
+    #[cube(launch)]
+    pub fn repack(
+        dst: &mut Array<u32>,
+        src: &Array<u32>,
+        term_width: u32,
+        term_height: u32,
+        char_width: u32,
+        char_height: u32,
+    ) {
+        let gh = ABSOLUTE_POS_Y;
+        let gw = ABSOLUTE_POS_X;
+        if gh >= term_height * char_height || gw >= term_width * char_width {
+            terminate!();
+        }
+        let h = gh / char_height;
+        let ch = gh % char_height;
+        let w = gw / char_width;
+        let cw = gw % char_width;
+        let idx_in = gh * (term_width * char_width) + gw;
+        let idx_out = h * term_width * char_height * char_width
+            + w * char_height * char_width
+            + ch * char_width
+            + cw;
+        dst[idx_out] = src[idx_in];
     }
 }
 
@@ -558,60 +604,77 @@ async fn render<RT: cubecl::prelude::Runtime>(
         // let _t = timer("resize");
         let resized_width = term_width * char_width;
         let resized_height = term_height * char_height;
+        let resized_len = (resized_height * resized_width) as usize;
 
-        // let resized = alloc_tensor::<RT, u8>(client, vec![resized_height, resized_width, 3]);
-        // let data = create_tensor::<RT, u8>(client, vec![height, width, 3], data);
-        // let cube_count = get_cube_count([resized_height, resized_width, 1], tiling);
+        let resized = client.empty(size_of::<u32>() * resized_len);
+        let input = client.create(u32::as_bytes(data));
 
-        // gpu::bicubic_resize::launch(
-        //     client,
-        //     cube_count,
-        //     tiling,
-        //     resized.as_arg(1),
-        //     data.as_arg(1),
-        //     resized_width,
-        //     resized_height,
-        //     width,
-        //     height,
-        // );
-        // let resized = client.read_one_async(resized.handle.binding()).await;
-        // (resized, resized_width, resized_height)
-
-        let mut resized = vec![0; (resized_width * resized_height * 4) as usize];
-        bicubic_resize(
-            &mut resized,
-            resized_width,
-            resized_height,
-            &data,
-            width,
-            height,
-        );
+        unsafe {
+            gpu::bicubic_resize::launch::<RT>(
+                client,
+                get_cube_count([resized_width, resized_height, 1], tiling),
+                tiling,
+                ArrayArg::from_raw_parts::<u32>(&resized, resized_len, 1),
+                ArrayArg::from_raw_parts::<u32>(&input, data.len(), 1),
+                ScalarArg::new(resized_width),
+                ScalarArg::new(resized_height),
+                ScalarArg::new(width),
+                ScalarArg::new(height),
+            );
+        };
         (resized, resized_width, resized_height)
     };
 
     let (repacked, repacked_width, repacked_height) = {
         // let _t = timer("repack");
+        // let resized = u32::from_bytes(&client.read_one_async(resized.binding()).await).to_owned();
+
         let repacked_width = resized_width;
         let repacked_height = resized_height;
-        let mut repacked = vec![0; (repacked_width * repacked_height * 4) as usize];
-        repack(
-            &mut repacked,
-            &resized,
-            term_width,
-            term_height,
-            char_width,
-            char_height,
-        );
+        let repacked = client.empty(size_of::<u32>() * (repacked_width * repacked_height) as usize);
+        unsafe {
+            gpu::repack::launch::<RT>(
+                client,
+                get_cube_count([repacked_width, repacked_height, 1], tiling),
+                tiling,
+                ArrayArg::from_raw_parts::<u32>(
+                    &repacked,
+                    (repacked_width * repacked_height) as usize,
+                    1,
+                ),
+                ArrayArg::from_raw_parts::<u32>(
+                    &resized,
+                    (resized_width * resized_height) as usize,
+                    1,
+                ),
+                ScalarArg::new(term_width),
+                ScalarArg::new(term_height),
+                ScalarArg::new(char_width),
+                ScalarArg::new(char_height),
+            );
+        }
+        // let mut repacked = vec![0; (repacked_width * repacked_height) as usize];
+        // repack(
+        //     &mut repacked,
+        //     &resized,
+        //     term_width,
+        //     term_height,
+        //     char_width,
+        //     char_height,
+        // );
+
         (repacked, repacked_width, repacked_height)
     };
 
     let (clustered, palette, clustered_width, clustered_height) = {
         // let _t = timer("cluster");
+        let repacked = u32::from_bytes(&client.read_one_async(repacked.binding()).await).to_owned();
         let clustered_width = resized_width;
         let clustered_height = resized_height;
         let mut clustered = vec![0; (term_width * term_height * 4) as usize];
         let mut palette = vec![(0, 0); (term_width * term_height) as usize];
         let mut brightness = vec![0; (resized_width * resized_height) as usize];
+
         compute_brightness(&mut brightness, &repacked);
 
         bimodal_luma_cluster(
@@ -702,7 +765,7 @@ async fn main() -> anyhow::Result<()> {
     let char_width = 8;
     let char_height = 16;
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tokio::task::JoinHandle<_>>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::task::JoinHandle<_>>(30);
 
     tokio::task::spawn(async move {
         let frames = std::sync::atomic::AtomicU64::default();
@@ -751,7 +814,7 @@ async fn main() -> anyhow::Result<()> {
             .await
             .unwrap()
         });
-        tx.send(handle).unwrap();
+        tx.send(handle).await.unwrap();
     }
 
     Ok(())
