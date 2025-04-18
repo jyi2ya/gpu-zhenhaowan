@@ -11,4 +11,5 @@ Rust 写的 GPU 加速的终端看动画片工具！
 
 等有空了把剩下的一半也搬上去，看看能不能直接不要 CPU 了
 
-![负载](assets/monitor.png)
+![wwwwwwwwwww](assets/monitor.png)
+
