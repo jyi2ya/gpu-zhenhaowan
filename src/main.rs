@@ -6,6 +6,7 @@ use crossterm::{
 };
 use fontdue::{Font, FontSettings};
 use std::fs;
+use tokio::io::AsyncWriteExt;
 
 #[inline]
 fn timer(label: &str) -> scope_timer::ScopeTimer {
@@ -314,11 +315,11 @@ struct VideoFrame {
     pub height: u32,
 }
 
-fn open_stream(video_path: &str) -> std::sync::mpsc::Receiver<VideoFrame> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+fn open_stream(video_path: &str) -> tokio::sync::mpsc::Receiver<VideoFrame> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
 
     let video_path = video_path.to_owned();
-    std::thread::spawn(move || {
+    tokio::task::spawn_blocking(move || {
         ffmpeg_next::init().unwrap();
         let mut ictx = ffmpeg_next::format::input(&video_path).unwrap();
         let input = ictx
@@ -360,7 +361,7 @@ fn open_stream(video_path: &str) -> std::sync::mpsc::Receiver<VideoFrame> {
                         height: rgb_frame.height(),
                     };
 
-                    if tx.send(frame_data).is_err() {
+                    if tx.blocking_send(frame_data).is_err() {
                         break;
                     }
                 }
@@ -371,7 +372,7 @@ fn open_stream(video_path: &str) -> std::sync::mpsc::Receiver<VideoFrame> {
     rx
 }
 
-fn render(
+async fn render(
     data: &[u8],
     width: u32,
     height: u32,
@@ -465,7 +466,7 @@ fn render(
     Ok((term, palette))
 }
 
-fn screen(term: Vec<u8>, palette: Vec<[[u8; 3]; 2]>, term_width: u32, term_height: u32) {
+async fn screen(term: Vec<u8>, palette: Vec<[[u8; 3]; 2]>, term_width: u32, term_height: u32) {
     let mut output = String::with_capacity((term_width * term_height * 20) as usize);
     let mut idx = 0;
 
@@ -497,39 +498,14 @@ fn screen(term: Vec<u8>, palette: Vec<[[u8; 3]; 2]>, term_width: u32, term_heigh
         output.push_str("\x1b[0m\n"); // 重置颜色并换行
     }
 
-    print!("{output}")
-
-    // let mut idx = 0;
-    // let mut stdout = std::io::stdout();
-    // execute!(stdout, crossterm::cursor::MoveTo(0, 0)).unwrap();
-    // for line in 0..term_height {
-    //     for row in 0..term_width {
-    //         let fg_color = palette[(line * term_width + row) as usize][(term[idx] % 2) as usize];
-    //         let bg_color =
-    //             palette[(line * term_width + row) as usize][(1 - term[idx] % 2) as usize];
-    //         let chr = char::from((term[idx] / 2) + ASCII_START as u8);
-    //         execute!(
-    //             stdout,
-    //             SetForegroundColor(Color::Rgb {
-    //                 r: fg_color[0],
-    //                 g: fg_color[1],
-    //                 b: fg_color[2]
-    //             }),
-    //             SetBackgroundColor(Color::Rgb {
-    //                 r: bg_color[0],
-    //                 g: bg_color[1],
-    //                 b: bg_color[2]
-    //             }),
-    //             Print(chr),
-    //         )
-    //         .unwrap();
-    //         idx += 1;
-    //     }
-    //     execute!(stdout, ResetColor, MoveToNextLine(1)).unwrap();
-    // }
+    tokio::io::stdout()
+        .write_all(output.as_bytes())
+        .await
+        .unwrap();
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let file = std::env::args().skip(1).next().unwrap();
     let bitmap_data = generate_ascii_bitmap("font.otf").unwrap();
     println!("Generated {} bytes of bitmap data", bitmap_data.len());
@@ -541,49 +517,53 @@ fn main() -> anyhow::Result<()> {
     let char_width = 8;
     let char_height = 16;
 
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<tokio::task::JoinHandle<_>>();
 
-    std::thread::spawn(move || {
+    tokio::task::spawn(async move {
         let frames = std::sync::atomic::AtomicU64::default();
         let start = std::time::Instant::now();
-        rx.into_iter()
-            .for_each(|frame: std::thread::JoinHandle<_>| {
-                let (term, palette) = frame.join().unwrap();
-                let now = std::time::Instant::now();
-                let duration = (now - start).as_secs();
-                let f = frames.load(std::sync::atomic::Ordering::Acquire);
-                println!(
-                    "ok, {duration} secs, {f} frames, {} fps",
-                    f / (duration + 1)
-                );
-                screen(term, palette, term_width, term_height);
-                frames.fetch_add(1, std::sync::atomic::Ordering::Release);
-            });
+        while let Some(frame) = rx.recv().await {
+            let (term, palette) = frame.await.unwrap();
+            let now = std::time::Instant::now();
+            let duration = (now - start).as_secs();
+            let f = frames.load(std::sync::atomic::Ordering::Acquire);
+            if rx.is_empty() {
+                screen(term, palette, term_width, term_height).await;
+                tokio::io::stdout()
+                    .write_all(
+                        format!(
+                            "ok, {duration} secs, {f} frames, {} fps",
+                            f / (duration + 1)
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            frames.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
     });
 
-    let stream = open_stream(&file);
+    let mut stream = open_stream(&file);
     let bitmap_data = std::sync::Arc::new(bitmap_data);
-    stream
-        .into_iter()
-        .map(|frame| {
-            let bitmap_data = std::sync::Arc::clone(&bitmap_data);
-            std::thread::spawn(move || {
-                render(
-                    &frame.data,
-                    frame.width,
-                    frame.height,
-                    term_width,
-                    term_height,
-                    char_width,
-                    char_height,
-                    &bitmap_data,
-                )
-                .unwrap()
-            })
-        })
-        .for_each(|handle| {
-            tx.send(handle).unwrap();
+    while let Some(frame) = stream.recv().await {
+        let bitmap_data = std::sync::Arc::clone(&bitmap_data);
+        let handle = tokio::task::spawn(async move {
+            render(
+                &frame.data,
+                frame.width,
+                frame.height,
+                term_width,
+                term_height,
+                char_width,
+                char_height,
+                &bitmap_data,
+            )
+            .await
+            .unwrap()
         });
+        tx.send(handle).unwrap();
+    }
 
     Ok(())
 }
