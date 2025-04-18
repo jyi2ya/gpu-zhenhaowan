@@ -123,6 +123,8 @@ mod gpu {
     use std::convert::Into;
     use std::default::Default;
 
+    use crate::ASCII_TABLE_SIZE;
+
     #[cube]
     fn pack_rgb(r: u32, g: u32, b: u32) -> u32 {
         let r = r;
@@ -233,6 +235,184 @@ mod gpu {
             + cw;
         dst[idx_out] = src[idx_in];
     }
+
+    #[cube(launch)]
+    pub fn bimodal_luma_cluster(
+        dst: &mut Array<u32>,
+        palette: &mut Array<u32>,
+        src: &Array<u32>,
+        brightness: &Array<u32>,
+        term_width: u32,
+        term_height: u32,
+        char_width: u32,
+        char_height: u32,
+    ) {
+        let px_per_img = char_width * char_height;
+
+        let h = ABSOLUTE_POS_Y;
+        let w = ABSOLUTE_POS_X;
+        if h >= term_height || w >= term_width {
+            terminate!();
+        }
+
+        let idx = h * term_width + w;
+
+        let mut l = 0;
+        let mut r = 256;
+        while l < r {
+            let m = l + (r - l) / 2;
+            let mut count = 0;
+            for i in idx * px_per_img..(idx + 1) * px_per_img {
+                if brightness[i] <= m as u32 {
+                    count += 1;
+                }
+            }
+            if count <= px_per_img / 2 {
+                l = m + 1;
+            } else {
+                r = m;
+            }
+        }
+        let median = l;
+
+        let mut sum1_0 = 0;
+        let mut sum1_1 = 0;
+        let mut sum1_2 = 0;
+        let mut sum2_0 = 0;
+        let mut sum2_1 = 0;
+        let mut sum2_2 = 0;
+        let mut cnt1 = 0;
+        let mut cnt2 = 0;
+
+        // 计算两类颜色的平均值
+        for i in idx * px_per_img..(idx + 1) * px_per_img {
+            let (r, g, b) = unpack_rgb(src[i]);
+            if brightness[i] <= median {
+                sum1_0 += r;
+                sum1_1 += g;
+                sum1_2 += b;
+                cnt1 += 1;
+            } else {
+                sum2_0 += r;
+                sum2_1 += g;
+                sum2_2 += b;
+                cnt2 += 1;
+            }
+        }
+
+        if cnt1 == 0 {
+            sum1_0 = sum2_0;
+            sum1_1 = sum2_1;
+            sum1_2 = sum2_2;
+            cnt1 = cnt2;
+        }
+
+        if cnt2 == 0 {
+            sum2_0 = sum1_0;
+            sum2_1 = sum1_1;
+            sum2_2 = sum1_2;
+            cnt2 = cnt1;
+        }
+
+        sum2_0 /= cnt2;
+        sum2_1 /= cnt2;
+        sum2_2 /= cnt2;
+        sum1_0 /= cnt1;
+        sum1_1 /= cnt1;
+        sum1_2 /= cnt1;
+
+        (for i in 0..4 {
+            let mut bits = 0;
+            for j in 0..32 {
+                let bit = if brightness[idx * px_per_img + i * 32 + j] <= median {
+                    u32::new(0)
+                } else {
+                    u32::new(1)
+                };
+                bits |= bit << j;
+            }
+            dst[idx * 4 + i] = bits;
+        });
+
+        palette[idx * 2] = pack_rgb(sum1_0, sum1_1, sum1_2);
+        palette[idx * 2 + 1] = pack_rgb(sum2_0, sum2_1, sum2_2);
+    }
+
+    #[cube(launch)]
+    pub fn compute_brightness(dst: &mut Array<u32>, src: &Array<u32>, width: u32, height: u32) {
+        let y = ABSOLUTE_POS_Y;
+        let x = ABSOLUTE_POS_X;
+        if y >= height || x >= width {
+            terminate!();
+        }
+
+        let idx = y * width + x;
+        let (r, g, b) = unpack_rgb(src[idx]);
+        let brightness = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        dst[idx] = brightness as u32;
+    }
+
+    #[cube]
+    fn count_zeros(x: u32) -> u32 {
+        let x = x - ((x >> 1) & 0x55555555);
+        let x = (x & 0x33333333) + ((x >> 2) & 0x33333333);
+        let x = (x + (x >> 4)) & 0x0F0F0F0F;
+        let x = x + (x >> 8);
+        let x = x + (x >> 16);
+        let ones = x & 0x0000003F;
+
+        32 - ones
+    }
+
+    #[cube(launch)]
+    pub fn calc_similarity(
+        dst: &mut Array<u32>,
+        src: &Array<u32>,
+        glyph: &Array<u32>,
+        term_width: u32,
+        term_height: u32,
+        char_width: u32,
+        char_height: u32,
+    ) {
+        let i = ABSOLUTE_POS_X;
+        let j = ABSOLUTE_POS_Y;
+        if i >= term_width * term_height || j >= ASCII_TABLE_SIZE * 2 {
+            terminate!();
+        }
+
+        let mut count = 0;
+        for k in 0..4 {
+            count += count_zeros(src[i * 4 + k] ^ glyph[j * 4 + k]);
+        }
+        dst[i * ASCII_TABLE_SIZE * 2 + j] = count;
+    }
+
+    #[cube(launch)]
+    pub fn get_ascii_string(
+        dst: &mut Array<u32>,
+        src: &Array<u32>,
+        term_width: u32,
+        term_height: u32,
+    ) {
+        let y = ABSOLUTE_POS_Y;
+        let x = ABSOLUTE_POS_X;
+        if y >= term_height || x >= term_width {
+            terminate!();
+        }
+
+        let idx = y * term_width + x;
+        let base = idx * ASCII_TABLE_SIZE * 2;
+        let mut max_similarity = 0;
+        let mut max_idx = 0;
+        for k in 0..ASCII_TABLE_SIZE * 2 {
+            if src[base + k] > max_similarity {
+                max_similarity = src[base + k];
+                max_idx = k;
+            }
+        }
+        let max_idx = max_idx as u32;
+        dst[idx] = max_idx;
+    }
 }
 
 pub fn bicubic_resize(
@@ -322,38 +502,6 @@ fn repack(
     }
 }
 
-fn _unpack(
-    dst: &mut [u8],
-    src: &[u8],
-    palette: &[[[u8; 4]; 2]],
-    term_width: u32,
-    term_height: u32,
-    char_width: u32,
-    char_height: u32,
-) {
-    for h in 0..term_height {
-        for w in 0..term_width {
-            for ch in 0..char_height {
-                for cw in 0..char_width {
-                    let gh = h * char_height + ch;
-                    let gw = w * char_width + cw;
-                    let idx_in_start = (gh * (term_width * char_width) + gw) as usize * 4;
-                    let idx_in_end = idx_in_start + 4;
-
-                    let block_idx = (h * term_width + w) as usize;
-                    let idx_out = (h * term_width * char_height * char_width
-                        + w * char_height * char_width
-                        + ch * char_width
-                        + cw) as usize;
-                    let color = palette[block_idx][src[idx_out] as usize];
-
-                    (&mut dst[idx_in_start..idx_in_end]).copy_from_slice(&color);
-                }
-            }
-        }
-    }
-}
-
 fn compute_brightness(dst: &mut [u32], src: &[u32]) {
     std::iter::zip(dst.iter_mut(), src.iter()).for_each(|(dst, src)| {
         let (r, g, b) = unpack_rgb(*src);
@@ -364,7 +512,7 @@ fn compute_brightness(dst: &mut [u32], src: &[u32]) {
 
 fn bimodal_luma_cluster(
     dst: &mut [u32],
-    palette: &mut [(u32, u32)],
+    palette: &mut [u32],
     src: &[u32],
     brightness: &[u32],
     term_width: u32,
@@ -375,7 +523,7 @@ fn bimodal_luma_cluster(
     let px_per_img = (char_width * char_height) as usize;
     let image_count = (term_width * term_height) as usize;
 
-    assert_eq!(palette.len(), image_count);
+    assert_eq!(palette.len(), image_count * 2);
     assert_eq!(dst.len(), image_count * 4);
 
     for h in 0..term_height {
@@ -469,8 +617,8 @@ fn bimodal_luma_cluster(
                 out[i] = bits;
             }
 
-            palette[idx].0 = pack_rgb(sum1.0 as u8, sum1.1 as u8, sum1.2 as u8);
-            palette[idx].1 = pack_rgb(sum2.0 as u8, sum2.1 as u8, sum2.2 as u8);
+            palette[idx * 2] = pack_rgb(sum1.0 as u8, sum1.1 as u8, sum1.2 as u8);
+            palette[idx * 2 + 1] = pack_rgb(sum2.0 as u8, sum2.1 as u8, sum2.2 as u8);
         }
     }
 }
@@ -485,31 +633,36 @@ fn calc_similarity(
     char_height: u32,
 ) {
     let mut idx = 0;
-    src.chunks_exact(4).for_each(|block| {
-        glyph.chunks_exact(4).for_each(|glyph| {
+    for i in 0..term_width * term_height {
+        for j in 0..ASCII_TABLE_SIZE * 2 {
             let mut count = 0;
-            for i in 0..4 {
-                count += (block[i] ^ glyph[i]).count_zeros() as u32;
+            for k in 0..4 {
+                count +=
+                    (src[(i * 4 + k) as usize] ^ glyph[(j * 4 + k) as usize]).count_zeros() as u32;
             }
-            dst[idx] = count;
-            idx += 1;
-        })
-    });
+            dst[(i * ASCII_TABLE_SIZE * 2 + j) as usize] = count;
+        }
+    }
 }
 
-fn get_ascii_string(dst: &mut [u32], src: &[u32]) {
-    let mut idx = 0;
-    src.chunks_exact(ASCII_TABLE_SIZE as usize * 2)
-        .for_each(|similarity| {
-            let max = similarity
-                .iter()
-                .enumerate()
-                .max_by_key(|(_idx, sim)| **sim)
-                .unwrap()
-                .0;
-            dst[idx] = max as u32;
-            idx += 1;
-        });
+fn get_ascii_string(dst: &mut [u32], src: &[u32], term_width: u32, term_height: u32) {
+    for y in 0..term_height {
+        for x in 0..term_width {
+            let idx = (y * term_width + x) as usize;
+            let base = (idx as u32 * ASCII_TABLE_SIZE * 2) as usize;
+            let mut max_similarity = 0;
+            let mut max_idx = 0;
+            for k in 0..ASCII_TABLE_SIZE * 2 {
+                let k = k as usize;
+                if src[base + k] > max_similarity {
+                    max_similarity = src[base + k];
+                    max_idx = k;
+                }
+            }
+            let max_idx = max_idx as u32;
+            dst[idx] = max_idx;
+        }
+    }
 }
 
 struct VideoFrame {
@@ -596,8 +749,8 @@ async fn render<RT: cubecl::prelude::Runtime>(
     term_height: u32,
     char_width: u32,
     char_height: u32,
-    bitmap_data: &[u32],
-) -> anyhow::Result<(Vec<u32>, Vec<(u32, u32)>)> {
+    glyph: &cubecl::server::Handle,
+) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
     let tiling = CubeDim::new_2d(16, 16);
 
     let (resized, resized_width, resized_height) = {
@@ -627,7 +780,6 @@ async fn render<RT: cubecl::prelude::Runtime>(
 
     let (repacked, repacked_width, repacked_height) = {
         // let _t = timer("repack");
-        // let resized = u32::from_bytes(&client.read_one_async(resized.binding()).await).to_owned();
 
         let repacked_width = resized_width;
         let repacked_height = resized_height;
@@ -653,69 +805,130 @@ async fn render<RT: cubecl::prelude::Runtime>(
                 ScalarArg::new(char_height),
             );
         }
-        // let mut repacked = vec![0; (repacked_width * repacked_height) as usize];
-        // repack(
-        //     &mut repacked,
-        //     &resized,
-        //     term_width,
-        //     term_height,
-        //     char_width,
-        //     char_height,
-        // );
 
         (repacked, repacked_width, repacked_height)
     };
 
     let (clustered, palette, clustered_width, clustered_height) = {
         // let _t = timer("cluster");
-        let repacked = u32::from_bytes(&client.read_one_async(repacked.binding()).await).to_owned();
+
+        let brightness =
+            client.empty(size_of::<u32>() * (repacked_height * repacked_width) as usize);
+        unsafe {
+            gpu::compute_brightness::launch::<RT>(
+                client,
+                get_cube_count([repacked_width, repacked_height, 1], tiling),
+                tiling,
+                ArrayArg::from_raw_parts::<u32>(
+                    &brightness,
+                    (repacked_height * repacked_width) as usize,
+                    1,
+                ),
+                ArrayArg::from_raw_parts::<u32>(
+                    &repacked,
+                    (repacked_height * repacked_width) as usize,
+                    1,
+                ),
+                ScalarArg::new(repacked_width),
+                ScalarArg::new(repacked_height),
+            );
+        }
+
         let clustered_width = resized_width;
         let clustered_height = resized_height;
-        let mut clustered = vec![0; (term_width * term_height * 4) as usize];
-        let mut palette = vec![(0, 0); (term_width * term_height) as usize];
-        let mut brightness = vec![0; (resized_width * resized_height) as usize];
+        let clustered = client.empty(size_of::<u32>() * (term_width * term_height * 4) as usize);
+        let palette = client.empty(size_of::<u32>() * (term_width * term_height * 2) as usize);
+        unsafe {
+            gpu::bimodal_luma_cluster::launch::<RT>(
+                client,
+                get_cube_count([term_width, term_height, 1], tiling),
+                tiling,
+                ArrayArg::from_raw_parts::<u32>(
+                    &clustered,
+                    (term_width * term_height * 4) as usize,
+                    1,
+                ),
+                ArrayArg::from_raw_parts::<u32>(
+                    &palette,
+                    (term_width * term_height * 2) as usize,
+                    1,
+                ),
+                ArrayArg::from_raw_parts::<u32>(
+                    &repacked,
+                    (repacked_width * repacked_height) as usize,
+                    1,
+                ),
+                ArrayArg::from_raw_parts::<u32>(
+                    &brightness,
+                    (repacked_width * repacked_height) as usize,
+                    1,
+                ),
+                ScalarArg::new(term_width),
+                ScalarArg::new(term_height),
+                ScalarArg::new(char_width),
+                ScalarArg::new(char_height),
+            );
+        }
 
-        compute_brightness(&mut brightness, &repacked);
-
-        bimodal_luma_cluster(
-            &mut clustered,
-            &mut palette,
-            &repacked,
-            &brightness,
-            term_width,
-            term_height,
-            char_width,
-            char_height,
-        );
         (clustered, palette, clustered_width, clustered_height)
     };
 
     let similarity = {
         // let _t = timer("similarity");
-        let mut similarity = vec![0; (term_width * term_height * ASCII_TABLE_SIZE * 2) as usize];
-        calc_similarity(
-            &mut similarity,
-            &clustered,
-            &bitmap_data,
-            term_width,
-            term_height,
-            char_width,
-            char_height,
-        );
+        let similarity = client
+            .empty(size_of::<u32>() * (term_width * term_height * ASCII_TABLE_SIZE * 2) as usize);
+        unsafe {
+            gpu::calc_similarity::launch::<RT>(
+                client,
+                get_cube_count([term_width * term_height, ASCII_TABLE_SIZE * 2, 1], tiling),
+                tiling,
+                ArrayArg::from_raw_parts::<u32>(
+                    &similarity,
+                    (term_width * term_height * ASCII_TABLE_SIZE * 2) as usize,
+                    1,
+                ),
+                ArrayArg::from_raw_parts::<u32>(
+                    &clustered,
+                    (clustered_width * clustered_height) as usize,
+                    1,
+                ),
+                ArrayArg::from_raw_parts::<u32>(&glyph, (ASCII_TABLE_SIZE * 2) as usize, 1),
+                ScalarArg::new(term_width),
+                ScalarArg::new(term_height),
+                ScalarArg::new(char_width),
+                ScalarArg::new(char_height),
+            );
+        }
+
         similarity
     };
 
     let term = {
-        // let _t = timer("decide");
-        let mut term = vec![0; (term_width * term_height) as usize];
-        get_ascii_string(&mut term, &similarity);
+        let term = client.empty(size_of::<u32>() * (term_width * term_height) as usize);
+        unsafe {
+            gpu::get_ascii_string::launch::<RT>(
+                client,
+                get_cube_count([term_width, term_height, 1], tiling),
+                tiling,
+                ArrayArg::from_raw_parts::<u32>(&term, (term_width * term_height) as usize, 1),
+                ArrayArg::from_raw_parts::<u32>(
+                    &similarity,
+                    (term_width * term_height * ASCII_TABLE_SIZE * 2) as usize,
+                    1,
+                ),
+                ScalarArg::new(term_width),
+                ScalarArg::new(term_height),
+            );
+        }
         term
     };
 
+    let palette = u32::from_bytes(&client.read_one_async(palette.binding()).await).to_owned();
+    let term = u32::from_bytes(&client.read_one_async(term.binding()).await).to_owned();
     Ok((term, palette))
 }
 
-async fn screen(term: Vec<u32>, palette: Vec<(u32, u32)>, term_width: u32, term_height: u32) {
+async fn screen(term: Vec<u32>, palette: Vec<u32>, term_width: u32, term_height: u32) {
     let mut output = String::with_capacity((term_width * term_height * 20) as usize);
     let mut idx = 0;
 
@@ -724,9 +937,9 @@ async fn screen(term: Vec<u32>, palette: Vec<(u32, u32)>, term_width: u32, term_
     for line in 0..term_height {
         for row in 0..term_width {
             let (fg_color, bg_color) = if term[idx] % 2 == 0 {
-                (palette[idx].0, palette[idx].1)
+                (palette[idx * 2], palette[idx * 2 + 1])
             } else {
-                (palette[idx].1, palette[idx].0)
+                (palette[idx * 2 + 1], palette[idx * 2])
             };
             let chr = char::from(((term[idx] / 2) + ASCII_START) as u8);
 
@@ -765,7 +978,7 @@ async fn main() -> anyhow::Result<()> {
     let char_width = 8;
     let char_height = 16;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::task::JoinHandle<_>>(30);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::task::JoinHandle<_>>(4);
 
     tokio::task::spawn(async move {
         let frames = std::sync::atomic::AtomicU64::default();
@@ -794,10 +1007,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let mut stream = open_stream(&file);
-    let bitmap_data = std::sync::Arc::new(bitmap_data);
     let client = std::sync::Arc::new(cubecl::wgpu::WgpuRuntime::client(&Default::default()));
+    let glyph = std::sync::Arc::new(client.create(u32::as_bytes(&bitmap_data)));
     while let Some(frame) = stream.recv().await {
-        let bitmap_data = std::sync::Arc::clone(&bitmap_data);
+        let glyph = std::sync::Arc::clone(&glyph);
         let client = std::sync::Arc::clone(&client);
         let handle = tokio::task::spawn(async move {
             render::<cubecl::wgpu::WgpuRuntime>(
@@ -809,7 +1022,7 @@ async fn main() -> anyhow::Result<()> {
                 term_height,
                 char_width,
                 char_height,
-                &bitmap_data,
+                &glyph,
             )
             .await
             .unwrap()
