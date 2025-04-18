@@ -1,0 +1,11 @@
+[package]
+name = "gpu-zhenhaowan"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+crossterm = { version = "0.29.0", default-features = false }
+ffmpeg-next = "7.1.0"
+fontdue = { version = "0.9.3", default-features = false }
+scope_timer = "0.2.3"

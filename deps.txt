@@ -1,0 +1,4 @@
+libavutil-dev
+libavformat-dev
+libavfilter-dev
+libavdevice-dev
