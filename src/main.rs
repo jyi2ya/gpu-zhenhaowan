@@ -1,9 +1,11 @@
-use std::io::Read as _;
+use std::rc::Rc;
 
+use compio::BufResult;
+use compio::io::AsyncReadExt;
+use compio::io::AsyncWriteExt as _;
 use cubecl::Runtime;
 use cubecl::prelude::*;
 use fontdue::{Font, FontSettings};
-use tokio::io::AsyncWriteExt;
 
 const ASCII_START: u32 = 32;
 const ASCII_END: u32 = 126;
@@ -389,22 +391,21 @@ struct VideoFrame {
     pub height: u32,
 }
 
-fn open_stream(
-    video_path: &str,
+struct VideoStream {
+    ffmpeg_stdout: compio::process::ChildStdout,
     width: u32,
     height: u32,
-) -> tokio::sync::mpsc::Receiver<VideoFrame> {
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+}
 
-    let video_path = video_path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let mut process = std::process::Command::new("ffmpeg");
+impl VideoStream {
+    pub fn open(path: &str, width: u32, height: u32) -> Option<Self> {
+        let mut process = compio::process::Command::new("ffmpeg");
         process
             .args(["-re"])
             .args(["-loglevel", "error"])
             .args(["-hwaccel", "vaapi"])
             .args(["-hwaccel_output_format", "vaapi"])
-            .args(["-i", &video_path])
+            .args(["-i", path])
             .args([
                 "-vf",
                 format!("scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=rgba")
@@ -417,85 +418,35 @@ fn open_stream(
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", "rgba"])
             .args(["pipe:"])
-            .stdout(std::process::Stdio::piped());
-        // .stderr(std::process::Stdio::null());
+            .stdout(std::process::Stdio::piped())
+            .unwrap();
         let mut process = process.spawn().unwrap();
-        let mut stdout = process.stdout.take().unwrap();
+        let stdout = process.stdout.take().unwrap();
 
-        let mut buf = vec![0; (width * height * 4) as usize];
-        while stdout.read_exact(&mut buf).is_ok() {
-            let data = u32::from_bytes(&buf).to_owned();
-            // let data = buf
-            //     .chunks_exact(4)
-            //     .map(|chunk| pack_rgb(chunk[0], chunk[1], chunk[2]))
-            //     .collect::<Vec<_>>();
-            assert_eq!(data.len() as u32, width * height);
-            let frame_data = VideoFrame {
-                data,
-                width,
-                height,
-            };
+        Some(Self {
+            ffmpeg_stdout: stdout,
+            width,
+            height,
+        })
+    }
 
-            if tx.blocking_send(frame_data).is_err() {
-                break;
-            }
+    pub async fn read_next(&mut self) -> Option<VideoFrame> {
+        let BufResult(result, data) = self
+            .ffmpeg_stdout
+            .read_exact(vec![
+                0;
+                size_of::<u32>() * (self.width * self.height) as usize
+            ])
+            .await;
+        match result {
+            Ok(_) => Some(VideoFrame {
+                data: u32::from_bytes(&data).to_owned(),
+                width: self.width,
+                height: self.height,
+            }),
+            Err(_) => None,
         }
-
-        // ffmpeg_next::init().unwrap();
-
-        // let mut ictx = ffmpeg_next::format::input(&video_path).unwrap();
-        // let input = ictx
-        //     .streams()
-        //     .best(ffmpeg_next::media::Type::Video)
-        //     .ok_or(ffmpeg_next::Error::StreamNotFound)
-        //     .unwrap();
-        // let video_stream_index = input.index();
-
-        // let context_decoder =
-        //     ffmpeg_next::codec::context::Context::from_parameters(input.parameters()).unwrap();
-        // let mut decoder = context_decoder.decoder().video().unwrap();
-
-        // use ffmpeg_next::software::scaling::Flags;
-        // let mut scaler = ffmpeg_next::software::scaling::Context::get(
-        //     decoder.format(),
-        //     decoder.width(),
-        //     decoder.height(),
-        //     ffmpeg_next::format::Pixel::RGBA,
-        //     decoder.width(),
-        //     decoder.height(),
-        //     Flags::BICUBIC,
-        // )
-        // .unwrap();
-
-        // let mut frame = ffmpeg_next::frame::Video::empty();
-        // let mut rgb_frame = ffmpeg_next::frame::Video::empty();
-
-        // for (stream, packet) in ictx.packets() {
-        //     if stream.index() == video_stream_index {
-        //         decoder.send_packet(&packet).unwrap();
-        //         while decoder.receive_frame(&mut frame).is_ok() {
-        //             scaler.run(&frame, &mut rgb_frame).unwrap();
-        //             let rgb_data = rgb_frame
-        //                 .data(0)
-        //                 .chunks_exact(4)
-        //                 .map(|chunk| pack_rgb(chunk[0], chunk[1], chunk[2]))
-        //                 .collect::<Vec<_>>();
-
-        //             let frame_data = VideoFrame {
-        //                 data: rgb_data,
-        //                 width: rgb_frame.width(),
-        //                 height: rgb_frame.height(),
-        //             };
-
-        //             if tx.blocking_send(frame_data).is_err() {
-        //                 break;
-        //             }
-        //         }
-        //     }
-        // }
-    });
-
-    rx
+    }
 }
 
 fn get_cube_count(shape: [u32; 3], tiling: CubeDim) -> CubeCount {
@@ -730,7 +681,7 @@ fn screen(term: Vec<u32>, palette: Vec<u32>, term_width: u32, term_height: u32) 
     output
 }
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> anyhow::Result<()> {
     let file = std::env::args().nth(1).expect("usage: $0 <video_path>");
     let bitmap_data = generate_ascii_bitmap("font.otf").unwrap();
@@ -743,45 +694,39 @@ async fn main() -> anyhow::Result<()> {
     let char_width = 8;
     let char_height = 16;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::task::JoinHandle<_>>(4);
+    let (tx, rx) = async_channel::bounded::<compio::runtime::Task<Result<_, _>>>(4);
 
-    tokio::task::spawn(async move {
-        let frames_rendered = std::sync::atomic::AtomicU64::default();
-        let frames_dropped = std::sync::atomic::AtomicU64::default();
+    compio::runtime::spawn(async move {
+        let mut frames_rendered = 0u64;
+        let mut frames_dropped = 0u64;
         let start = std::time::Instant::now();
-        while let Some(frame) = rx.recv().await {
+        while let Ok(frame) = rx.recv().await {
             if !frame.is_finished() && !rx.is_empty() {
-                frames_dropped.fetch_add(1, std::sync::atomic::Ordering::Release);
+                frames_dropped += 1;
                 continue;
             }
             let (term, palette) = frame.await.unwrap();
             let now = std::time::Instant::now();
             let duration = (now - start).as_secs_f64();
-            let rendered = frames_rendered.load(std::sync::atomic::Ordering::Acquire) as f64;
-            let dropped = frames_dropped.load(std::sync::atomic::Ordering::Acquire) as f64;
             let screen = screen(term, palette, term_width, term_height);
-            tokio::io::stdout()
-                .write_all(
-                    format!(
-                        "{screen}ok, {duration:.2} secs, {rendered} frames, {dropped} dropped, {:.2}/{:.2} fps",
-                        rendered / duration,
-                        (rendered + dropped) / duration,
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            frames_rendered.fetch_add(1, std::sync::atomic::Ordering::Release);
+            let content = format!(
+                "{screen}ok, {duration:.2} secs, {frames_rendered} frames, {frames_dropped} dropped, {:.2}/{:.2} fps",
+                frames_rendered as f64 / duration,
+                (frames_rendered + frames_dropped) as f64 / duration,
+            );
+            compio::fs::stdout().write_all(content).await.unwrap();
+            frames_rendered += 1;
         }
-    });
+    }).detach();
 
-    let mut stream = open_stream(&file, term_width * char_width, term_height * char_height);
-    let client = std::sync::Arc::new(cubecl::wgpu::WgpuRuntime::client(&Default::default()));
-    let glyph = std::sync::Arc::new(client.create(u32::as_bytes(&bitmap_data)));
-    while let Some(frame) = stream.recv().await {
-        let glyph = std::sync::Arc::clone(&glyph);
-        let client = std::sync::Arc::clone(&client);
-        let handle = tokio::task::spawn(async move {
+    let mut stream =
+        VideoStream::open(&file, term_width * char_width, term_height * char_height).unwrap();
+    let client = Rc::new(cubecl::wgpu::WgpuRuntime::client(&Default::default()));
+    let glyph = Rc::new(client.create(u32::as_bytes(&bitmap_data)));
+    while let Some(frame) = stream.read_next().await {
+        let client = Rc::clone(&client);
+        let glyph = Rc::clone(&glyph);
+        let handle = compio::runtime::spawn(async move {
             render::<cubecl::wgpu::WgpuRuntime>(
                 &client,
                 &frame.data,
