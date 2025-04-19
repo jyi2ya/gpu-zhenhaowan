@@ -400,6 +400,7 @@ fn open_stream(
     tokio::task::spawn_blocking(move || {
         let mut process = std::process::Command::new("ffmpeg");
         process
+            .args(["-re"])
             .args(["-loglevel", "error"])
             .args(["-hwaccel", "vaapi"])
             .args(["-hwaccel_output_format", "vaapi"])
