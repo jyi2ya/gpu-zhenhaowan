@@ -387,7 +387,7 @@ fn generate_ascii_bitmap(font_path: &str) -> Result<Vec<u32>, Box<dyn std::error
 }
 
 struct VideoFrame {
-    pub data: Vec<u32>,
+    pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
 }
@@ -441,7 +441,7 @@ impl VideoStream {
             .await;
         match result {
             Ok(_) => Some(VideoFrame {
-                data: u32::from_bytes(&data).to_owned(),
+                data,
                 width: self.width,
                 height: self.height,
             }),
@@ -458,9 +458,99 @@ fn get_cube_count(shape: [u32; 3], tiling: CubeDim) -> CubeCount {
     )
 }
 
+mod edge {
+    use image::Pixel as _;
+
+    fn compute_histogram(image: &image::GrayImage) -> [u32; 256] {
+        let mut hist = [0u32; 256];
+        for pixel in image.pixels() {
+            let value = pixel.0[0];
+            hist[value as usize] += 1;
+        }
+        hist
+    }
+
+    fn otsu_threshold(hist: &[u32; 256]) -> u8 {
+        let total_pixels = hist.iter().sum::<u32>() as f64;
+        let mut cumulative_sum = [0u32; 256];
+        cumulative_sum[0] = hist[0];
+        for i in 1..256 {
+            cumulative_sum[i] = cumulative_sum[i - 1] + hist[i];
+        }
+        let sum_total: u32 = hist.iter().enumerate().map(|(i, &v)| i as u32 * v).sum();
+        let mut max_sigma = 0.0;
+        let mut threshold = 0u8;
+        for t in 1u8..255 {
+            let w0 = cumulative_sum[usize::from(t)] as f64 / total_pixels;
+            let w1 = (cumulative_sum[255] - cumulative_sum[usize::from(t)]) as f64 / total_pixels;
+            if w0 == 0.0 || w1 == 0.0 {
+                continue;
+            }
+            let sum_w0: u32 = hist[..usize::from(t)]
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| i as u32 * v)
+                .sum();
+            let u0 = sum_w0 as f64 / w0;
+            let sum_w1 = sum_total - sum_w0;
+            let u1 = sum_w1 as f64 / w1;
+            let sigma = w0 * w1 * (u1 - u0).powi(2);
+            if sigma > max_sigma {
+                max_sigma = sigma;
+                threshold = t;
+            }
+        }
+
+        // imageproc::edges::canny panics without this
+        if threshold == 0 { 1 } else { threshold }
+    }
+
+    fn otsu_thresholding(image: &image::GrayImage) -> (f32, f32) {
+        let mut hist = compute_histogram(image);
+
+        for i in 1..255 {
+            hist[i] = (hist[i - 1] + hist[i] * 2 + hist[i + 1]) / 4;
+        }
+
+        let th_otsu = f32::from(otsu_threshold(&hist));
+
+        let th1 = th_otsu * 0.7;
+        let th2 = th_otsu * 1.1;
+
+        (th1.min(254.0), th2.min(254.0))
+    }
+
+    fn get_image_edge_overlay(img: &image::DynamicImage) -> image::RgbaImage {
+        let gray_img: image::GrayImage = img.to_luma8();
+
+        let (canny_low, canny_high) = otsu_thresholding(&gray_img);
+
+        let edges = imageproc::edges::canny(&gray_img, canny_low, canny_high);
+        let overlay = image::RgbaImage::from_fn(edges.width(), edges.height(), |x, y| {
+            let pixel = edges.get_pixel(x, y).to_owned();
+            let value = pixel.channels()[0];
+            let black = image::Rgba([0, 0, 0, 255]);
+            let transparent = image::Rgba([0, 0, 0, 0]);
+            match value {
+                255 => black,
+                _ => transparent,
+            }
+        });
+        overlay
+    }
+
+    pub fn enhance_edge(img: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
+        let raw_img = image::RgbaImage::from_raw(width, height, img).unwrap();
+        let mut dynamic_img = image::DynamicImage::ImageRgba8(raw_img);
+        let edge_overlay = get_image_edge_overlay(&dynamic_img);
+        image::imageops::overlay(&mut dynamic_img, &edge_overlay, 0, 0);
+        dynamic_img.into_rgba8().into_raw()
+    }
+}
+
 async fn render<RT: cubecl::prelude::Runtime>(
     client: &cubecl::client::ComputeClient<RT::Server, RT::Channel>,
-    data: &[u32],
+    data: &[u8],
     width: u32,
     height: u32,
     term_width: u32,
@@ -471,8 +561,13 @@ async fn render<RT: cubecl::prelude::Runtime>(
 ) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
     let tiling = CubeDim::new_2d(16, 16);
 
+    let data = data.to_owned();
+    let enhanced = compio::runtime::spawn_blocking(move || edge::enhance_edge(data, width, height))
+        .await
+        .unwrap();
+
     let (resized, resized_width, resized_height) = {
-        let resized = client.create(u32::as_bytes(data));
+        let resized = client.create(&enhanced);
         let resized_width = width;
         let resized_height = height;
 
