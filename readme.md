@@ -7,7 +7,7 @@ Rust 写的 GPU 加速的终端看动画片工具！
 
 使用 [CubeCL](https://github.com/tracel-ai/cubecl)，把大概一半的算子挪到了集显上跑，这下改装成服务器的小笔记本剩下的最后一块硅片也被用起来了，可喜可贺，物有所值！
 
-能跑 90 fps，真是太酷了！
+~~能跑 90 fps，真是太酷了！~~
 
 ~~等有空了把剩下的一半也搬上去，看看能不能直接不要 CPU 了~~
 
@@ -15,3 +15,9 @@ Rust 写的 GPU 加速的终端看动画片工具！
 
 ![wwwwwwwwwww](assets/monitor.png)
 
+
+```plain
+ok, 22.11 secs, 706 frames, 1937 dropped, 31.93/119.54 fps
+```
+
+嘻嘻，借助 vaapi 伟力，现在是 120 fps 了

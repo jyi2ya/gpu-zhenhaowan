@@ -1,3 +1,5 @@
+use std::io::Read as _;
+
 use cubecl::Runtime;
 use cubecl::prelude::*;
 use fontdue::{Font, FontSettings};
@@ -6,6 +8,10 @@ use tokio::io::AsyncWriteExt;
 const ASCII_START: u32 = 32;
 const ASCII_END: u32 = 126;
 const ASCII_TABLE_SIZE: u32 = ASCII_END - ASCII_START + 1;
+
+const PACK_R_OFFSET: u32 = 0;
+const PACK_G_OFFSET: u32 = 8;
+const PACK_B_OFFSET: u32 = 16;
 
 #[no_implicit_prelude]
 mod gpu {
@@ -17,18 +23,18 @@ mod gpu {
     use std::convert::Into;
     use std::default::Default;
 
-    use crate::ASCII_TABLE_SIZE;
+    use crate::{ASCII_TABLE_SIZE, PACK_B_OFFSET, PACK_G_OFFSET, PACK_R_OFFSET};
 
     #[cube]
     fn pack_rgb(r: u32, g: u32, b: u32) -> u32 {
-        b << 16 | g << 8 | r
+        b << PACK_B_OFFSET | g << PACK_G_OFFSET | r << PACK_R_OFFSET
     }
 
     #[cube]
     fn unpack_rgb(packed: u32) -> (u32, u32, u32) {
-        let b = packed >> 16;
-        let g = (packed >> 8) & 0xff;
-        let r = packed & 0xff;
+        let b = (packed >> PACK_B_OFFSET) & 0xff;
+        let g = (packed >> PACK_G_OFFSET) & 0xff;
+        let r = (packed >> PACK_R_OFFSET) & 0xff;
         (r, g, b)
     }
 
@@ -310,13 +316,13 @@ fn pack_rgb(r: u8, g: u8, b: u8) -> u32 {
     let r = r as u32;
     let g = g as u32;
     let b = b as u32;
-    b << 16 | g << 8 | r
+    b << PACK_B_OFFSET | g << PACK_G_OFFSET | r << PACK_R_OFFSET
 }
 
 fn unpack_rgb(packed: u32) -> (u8, u8, u8) {
-    let b = packed >> 16;
-    let g = (packed >> 8) & 0xff;
-    let r = packed & 0xff;
+    let b = (packed >> PACK_B_OFFSET) & 0xff;
+    let g = (packed >> PACK_G_OFFSET) & 0xff;
+    let r = (packed >> PACK_R_OFFSET) & 0xff;
     (r as u8, g as u8, b as u8)
 }
 
@@ -383,62 +389,109 @@ struct VideoFrame {
     pub height: u32,
 }
 
-fn open_stream(video_path: &str) -> tokio::sync::mpsc::Receiver<VideoFrame> {
+fn open_stream(
+    video_path: &str,
+    width: u32,
+    height: u32,
+) -> tokio::sync::mpsc::Receiver<VideoFrame> {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
 
     let video_path = video_path.to_owned();
     tokio::task::spawn_blocking(move || {
-        ffmpeg_next::init().unwrap();
-        let mut ictx = ffmpeg_next::format::input(&video_path).unwrap();
-        let input = ictx
-            .streams()
-            .best(ffmpeg_next::media::Type::Video)
-            .ok_or(ffmpeg_next::Error::StreamNotFound)
-            .unwrap();
-        let video_stream_index = input.index();
+        let mut process = std::process::Command::new("ffmpeg");
+        process
+            .args(["-loglevel", "error"])
+            .args(["-hwaccel", "vaapi"])
+            .args(["-hwaccel_output_format", "vaapi"])
+            .args(["-i", &video_path])
+            .args([
+                "-vf",
+                format!("scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=rgba")
+                    .as_str(),
+            ])
+            // .args([
+            //     "-vf",
+            //     format!("scale=w={width}:h={height},format=rgba").as_str(),
+            // ])
+            .args(["-f", "rawvideo"])
+            .args(["-pix_fmt", "rgba"])
+            .args(["pipe:"])
+            .stdout(std::process::Stdio::piped());
+        // .stderr(std::process::Stdio::null());
+        let mut process = process.spawn().unwrap();
+        let mut stdout = process.stdout.take().unwrap();
 
-        let context_decoder =
-            ffmpeg_next::codec::context::Context::from_parameters(input.parameters()).unwrap();
-        let mut decoder = context_decoder.decoder().video().unwrap();
+        let mut buf = vec![0; (width * height * 4) as usize];
+        while stdout.read_exact(&mut buf).is_ok() {
+            let data = u32::from_bytes(&buf).to_owned();
+            // let data = buf
+            //     .chunks_exact(4)
+            //     .map(|chunk| pack_rgb(chunk[0], chunk[1], chunk[2]))
+            //     .collect::<Vec<_>>();
+            assert_eq!(data.len() as u32, width * height);
+            let frame_data = VideoFrame {
+                data,
+                width,
+                height,
+            };
 
-        use ffmpeg_next::software::scaling::Flags;
-        let mut scaler = ffmpeg_next::software::scaling::Context::get(
-            decoder.format(),
-            decoder.width(),
-            decoder.height(),
-            ffmpeg_next::format::Pixel::RGBA,
-            decoder.width(),
-            decoder.height(),
-            Flags::BICUBIC,
-        )
-        .unwrap();
-
-        let mut frame = ffmpeg_next::frame::Video::empty();
-        let mut rgb_frame = ffmpeg_next::frame::Video::empty();
-
-        for (stream, packet) in ictx.packets() {
-            if stream.index() == video_stream_index {
-                decoder.send_packet(&packet).unwrap();
-                while decoder.receive_frame(&mut frame).is_ok() {
-                    scaler.run(&frame, &mut rgb_frame).unwrap();
-                    let rgb_data = rgb_frame
-                        .data(0)
-                        .chunks_exact(4)
-                        .map(|chunk| pack_rgb(chunk[0], chunk[1], chunk[2]))
-                        .collect::<Vec<_>>();
-
-                    let frame_data = VideoFrame {
-                        data: rgb_data,
-                        width: rgb_frame.width(),
-                        height: rgb_frame.height(),
-                    };
-
-                    if tx.blocking_send(frame_data).is_err() {
-                        break;
-                    }
-                }
+            if tx.blocking_send(frame_data).is_err() {
+                break;
             }
         }
+
+        // ffmpeg_next::init().unwrap();
+
+        // let mut ictx = ffmpeg_next::format::input(&video_path).unwrap();
+        // let input = ictx
+        //     .streams()
+        //     .best(ffmpeg_next::media::Type::Video)
+        //     .ok_or(ffmpeg_next::Error::StreamNotFound)
+        //     .unwrap();
+        // let video_stream_index = input.index();
+
+        // let context_decoder =
+        //     ffmpeg_next::codec::context::Context::from_parameters(input.parameters()).unwrap();
+        // let mut decoder = context_decoder.decoder().video().unwrap();
+
+        // use ffmpeg_next::software::scaling::Flags;
+        // let mut scaler = ffmpeg_next::software::scaling::Context::get(
+        //     decoder.format(),
+        //     decoder.width(),
+        //     decoder.height(),
+        //     ffmpeg_next::format::Pixel::RGBA,
+        //     decoder.width(),
+        //     decoder.height(),
+        //     Flags::BICUBIC,
+        // )
+        // .unwrap();
+
+        // let mut frame = ffmpeg_next::frame::Video::empty();
+        // let mut rgb_frame = ffmpeg_next::frame::Video::empty();
+
+        // for (stream, packet) in ictx.packets() {
+        //     if stream.index() == video_stream_index {
+        //         decoder.send_packet(&packet).unwrap();
+        //         while decoder.receive_frame(&mut frame).is_ok() {
+        //             scaler.run(&frame, &mut rgb_frame).unwrap();
+        //             let rgb_data = rgb_frame
+        //                 .data(0)
+        //                 .chunks_exact(4)
+        //                 .map(|chunk| pack_rgb(chunk[0], chunk[1], chunk[2]))
+        //                 .collect::<Vec<_>>();
+
+        //             let frame_data = VideoFrame {
+        //                 data: rgb_data,
+        //                 width: rgb_frame.width(),
+        //                 height: rgb_frame.height(),
+        //             };
+
+        //             if tx.blocking_send(frame_data).is_err() {
+        //                 break;
+        //             }
+        //         }
+        //     }
+        // }
     });
 
     rx
@@ -466,27 +519,31 @@ async fn render<RT: cubecl::prelude::Runtime>(
     let tiling = CubeDim::new_2d(16, 16);
 
     let (resized, resized_width, resized_height) = {
-        // let _t = timer("resize");
-        let resized_width = term_width * char_width;
-        let resized_height = term_height * char_height;
-        let resized_len = (resized_height * resized_width) as usize;
+        let resized = client.create(u32::as_bytes(data));
+        let resized_width = width;
+        let resized_height = height;
 
-        let resized = client.empty(size_of::<u32>() * resized_len);
-        let input = client.create(u32::as_bytes(data));
+        // // let _t = timer("resize");
+        // let resized_width = term_width * char_width;
+        // let resized_height = term_height * char_height;
+        // let resized_len = (resized_height * resized_width) as usize;
 
-        unsafe {
-            gpu::bicubic_resize::launch::<RT>(
-                client,
-                get_cube_count([resized_width, resized_height, 1], tiling),
-                tiling,
-                ArrayArg::from_raw_parts::<u32>(&resized, resized_len, 1),
-                ArrayArg::from_raw_parts::<u32>(&input, data.len(), 1),
-                ScalarArg::new(resized_width),
-                ScalarArg::new(resized_height),
-                ScalarArg::new(width),
-                ScalarArg::new(height),
-            );
-        };
+        // let resized = client.empty(size_of::<u32>() * resized_len);
+        // let input = client.create(u32::as_bytes(data));
+
+        // unsafe {
+        //     gpu::bicubic_resize::launch::<RT>(
+        //         client,
+        //         get_cube_count([resized_width, resized_height, 1], tiling),
+        //         tiling,
+        //         ArrayArg::from_raw_parts::<u32>(&resized, resized_len, 1),
+        //         ArrayArg::from_raw_parts::<u32>(&input, data.len(), 1),
+        //         ScalarArg::new(resized_width),
+        //         ScalarArg::new(resized_height),
+        //         ScalarArg::new(width),
+        //         ScalarArg::new(height),
+        //     );
+        // };
         (resized, resized_width, resized_height)
     };
 
@@ -638,7 +695,7 @@ async fn render<RT: cubecl::prelude::Runtime>(
     Ok((term, palette))
 }
 
-async fn screen(term: Vec<u32>, palette: Vec<u32>, term_width: u32, term_height: u32) {
+fn screen(term: Vec<u32>, palette: Vec<u32>, term_width: u32, term_height: u32) -> String {
     let mut output = String::with_capacity((term_width * term_height * 20) as usize);
     let mut idx = 0;
 
@@ -669,10 +726,7 @@ async fn screen(term: Vec<u32>, palette: Vec<u32>, term_width: u32, term_height:
         output.push_str("\x1b[0m\n"); // 重置颜色并换行
     }
 
-    tokio::io::stdout()
-        .write_all(output.as_bytes())
-        .await
-        .unwrap();
+    output
 }
 
 #[tokio::main]
@@ -691,32 +745,36 @@ async fn main() -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<tokio::task::JoinHandle<_>>(4);
 
     tokio::task::spawn(async move {
-        let frames = std::sync::atomic::AtomicU64::default();
+        let frames_rendered = std::sync::atomic::AtomicU64::default();
+        let frames_dropped = std::sync::atomic::AtomicU64::default();
         let start = std::time::Instant::now();
         while let Some(frame) = rx.recv().await {
+            if !frame.is_finished() && !rx.is_empty() {
+                frames_dropped.fetch_add(1, std::sync::atomic::Ordering::Release);
+                continue;
+            }
             let (term, palette) = frame.await.unwrap();
             let now = std::time::Instant::now();
-            let duration = (now - start).as_secs();
-            let f = frames.load(std::sync::atomic::Ordering::Acquire);
-            let magic = true;
-            if rx.is_empty() || magic {
-                screen(term, palette, term_width, term_height).await;
-                tokio::io::stdout()
-                    .write_all(
-                        format!(
-                            "ok, {duration} secs, {f} frames, {} fps",
-                            f / (duration + 1)
-                        )
-                        .as_bytes(),
+            let duration = (now - start).as_secs_f64();
+            let rendered = frames_rendered.load(std::sync::atomic::Ordering::Acquire) as f64;
+            let dropped = frames_dropped.load(std::sync::atomic::Ordering::Acquire) as f64;
+            let screen = screen(term, palette, term_width, term_height);
+            tokio::io::stdout()
+                .write_all(
+                    format!(
+                        "{screen}ok, {duration:.2} secs, {rendered} frames, {dropped} dropped, {:.2}/{:.2} fps",
+                        rendered / duration,
+                        (rendered + dropped) / duration,
                     )
-                    .await
-                    .unwrap();
-            }
-            frames.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            frames_rendered.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     });
 
-    let mut stream = open_stream(&file);
+    let mut stream = open_stream(&file, term_width * char_width, term_height * char_height);
     let client = std::sync::Arc::new(cubecl::wgpu::WgpuRuntime::client(&Default::default()));
     let glyph = std::sync::Arc::new(client.create(u32::as_bytes(&bitmap_data)));
     while let Some(frame) = stream.recv().await {
