@@ -233,6 +233,7 @@ mod gpu {
             dst[idx * 4 + i] = bits;
         });
 
+        // sum1: 暗色部 sum2: 亮色部
         palette[idx * 2] = pack_rgb(sum1_0, sum1_1, sum1_2);
         palette[idx * 2 + 1] = pack_rgb(sum2_0, sum2_1, sum2_2);
     }
@@ -655,11 +656,15 @@ fn screen(term: Vec<u32>, palette: Vec<u32>, term_width: u32, term_height: u32) 
 
     for _line in 0..term_height {
         for _row in 0..term_width {
+            let dark = palette[idx * 2];
+            let bright = palette[idx * 2 + 1];
+
             let (fg_color, bg_color) = if term[idx] % 2 == 0 {
-                (palette[idx * 2], palette[idx * 2 + 1])
+                (bright, dark)
             } else {
-                (palette[idx * 2 + 1], palette[idx * 2])
+                (dark, bright)
             };
+
             let chr = char::from(((term[idx] / 2) + ASCII_START) as u8);
 
             let (fr, fg, fb) = unpack_rgb(fg_color);
