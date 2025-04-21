@@ -27,6 +27,21 @@ mod gpu {
 
     use crate::{ASCII_TABLE_SIZE, PACK_B_OFFSET, PACK_G_OFFSET, PACK_R_OFFSET};
 
+    #[cube(launch)]
+    pub fn overlay_edge(image: &mut Array<u32>, edge: &Array<u32>, len: u32) {
+        let pos = ABSOLUTE_POS;
+        if pos >= len {
+            terminate!();
+        }
+
+        let offset = pos % 32;
+        let idx = pos / 32;
+        let overlay = (edge[idx] >> (31 - offset)) & 0x1;
+        if overlay == 1 {
+            image[pos] = 0;
+        }
+    }
+
     #[cube]
     fn pack_rgb(r: u32, g: u32, b: u32) -> u32 {
         b << PACK_B_OFFSET | g << PACK_G_OFFSET | r << PACK_R_OFFSET
@@ -459,7 +474,6 @@ fn get_cube_count(shape: [u32; 3], tiling: CubeDim) -> CubeCount {
 }
 
 mod edge {
-    use image::Pixel as _;
 
     fn compute_histogram(image: &image::GrayImage) -> [u32; 256] {
         let mut hist = [0u32; 256];
@@ -505,7 +519,7 @@ mod edge {
         if threshold == 0 { 1 } else { threshold }
     }
 
-    fn otsu_thresholding(image: &image::GrayImage) -> (f32, f32) {
+    pub fn otsu_thresholding(image: &image::GrayImage) -> (f32, f32) {
         let mut hist = compute_histogram(image);
 
         for i in 1..255 {
@@ -518,33 +532,6 @@ mod edge {
         let th2 = th_otsu * 1.1;
 
         (th1.min(254.0), th2.min(254.0))
-    }
-
-    fn get_image_edge_overlay(img: &image::DynamicImage) -> image::RgbaImage {
-        let gray_img: image::GrayImage = img.to_luma8();
-
-        let (canny_low, canny_high) = otsu_thresholding(&gray_img);
-
-        let edges = imageproc::edges::canny(&gray_img, canny_low, canny_high);
-        let overlay = image::RgbaImage::from_fn(edges.width(), edges.height(), |x, y| {
-            let pixel = edges.get_pixel(x, y).to_owned();
-            let value = pixel.channels()[0];
-            let black = image::Rgba([0, 0, 0, 255]);
-            let transparent = image::Rgba([0, 0, 0, 0]);
-            match value {
-                255 => black,
-                _ => transparent,
-            }
-        });
-        overlay
-    }
-
-    pub fn enhance_edge(img: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
-        let raw_img = image::RgbaImage::from_raw(width, height, img).unwrap();
-        let mut dynamic_img = image::DynamicImage::ImageRgba8(raw_img);
-        let edge_overlay = get_image_edge_overlay(&dynamic_img);
-        image::imageops::overlay(&mut dynamic_img, &edge_overlay, 0, 0);
-        dynamic_img.into_rgba8().into_raw()
     }
 }
 
@@ -561,39 +548,89 @@ async fn render<RT: cubecl::prelude::Runtime>(
 ) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
     let tiling = CubeDim::new_2d(16, 16);
 
-    let data = data.to_owned();
-    let enhanced = compio::runtime::spawn_blocking(move || edge::enhance_edge(data, width, height))
-        .await
-        .unwrap();
+    let resized = client.create(data);
+    let (resized_width, resized_height) = (width, height);
 
-    let (resized, resized_width, resized_height) = {
-        let resized = client.create(&enhanced);
-        let resized_width = width;
-        let resized_height = height;
+    let data_vec = data.to_owned();
+    let edges = compio::runtime::spawn_blocking(move || {
+        let raw_img = image::RgbaImage::from_raw(width, height, data_vec).unwrap();
+        let dynamic_img = image::DynamicImage::ImageRgba8(raw_img);
+        let gray_img: image::GrayImage = dynamic_img.to_luma8();
+        let (canny_low, canny_high) = edge::otsu_thresholding(&gray_img);
+        let edges = imageproc::edges::canny(&gray_img, canny_low, canny_high);
+        // edges.into_iter().map(|&px| px as u32).collect::<Vec<_>>()
+        edges
+            .chunks(32)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&val| match val {
+                        255 => 1,
+                        _ => 0,
+                    })
+                    .fold(0u32, |acc, b| (acc << 1) | b)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap();
 
-        // // let _t = timer("resize");
-        // let resized_width = term_width * char_width;
-        // let resized_height = term_height * char_height;
-        // let resized_len = (resized_height * resized_width) as usize;
+    let edge = client.create(u32::as_bytes(&edges));
+    unsafe {
+        let len = resized_width * resized_height;
+        gpu::overlay_edge::launch::<RT>(
+            client,
+            CubeCount::new_1d(len.div_ceil(256)),
+            CubeDim::new_1d(256),
+            ArrayArg::from_raw_parts::<u32>(&resized, len as usize, 1),
+            ArrayArg::from_raw_parts::<u32>(&edge, edges.len(), 1),
+            ScalarArg::new(len),
+        );
+    }
 
-        // let resized = client.empty(size_of::<u32>() * resized_len);
-        // let input = client.create(u32::as_bytes(data));
+    // let image = u32::from_bytes(data);
+    // let enhanced = image
+    //     .into_iter()
+    //     .enumerate()
+    //     .map(|(idx, &img)| {
+    //         let offset = idx % 32;
+    //         let idx = idx / 32;
+    //         let overlay = (edges[idx] >> (31 - offset)) & 0x1;
+    //         match overlay {
+    //             1 => 0,
+    //             _ => img,
+    //         }
+    //     })
+    //     .collect::<Vec<_>>();
 
-        // unsafe {
-        //     gpu::bicubic_resize::launch::<RT>(
-        //         client,
-        //         get_cube_count([resized_width, resized_height, 1], tiling),
-        //         tiling,
-        //         ArrayArg::from_raw_parts::<u32>(&resized, resized_len, 1),
-        //         ArrayArg::from_raw_parts::<u32>(&input, data.len(), 1),
-        //         ScalarArg::new(resized_width),
-        //         ScalarArg::new(resized_height),
-        //         ScalarArg::new(width),
-        //         ScalarArg::new(height),
-        //     );
-        // };
-        (resized, resized_width, resized_height)
-    };
+    // let (resized, resized_width, resized_height) = {
+    //     // let resized = client.create(u32::as_bytes(&enhanced));
+    //     let resized_width = width;
+    //     let resized_height = height;
+
+    //     // // let _t = timer("resize");
+    //     // let resized_width = term_width * char_width;
+    //     // let resized_height = term_height * char_height;
+    //     // let resized_len = (resized_height * resized_width) as usize;
+
+    //     // let resized = client.empty(size_of::<u32>() * resized_len);
+    //     // let input = client.create(u32::as_bytes(data));
+
+    //     // unsafe {
+    //     //     gpu::bicubic_resize::launch::<RT>(
+    //     //         client,
+    //     //         get_cube_count([resized_width, resized_height, 1], tiling),
+    //     //         tiling,
+    //     //         ArrayArg::from_raw_parts::<u32>(&resized, resized_len, 1),
+    //     //         ArrayArg::from_raw_parts::<u32>(&input, data.len(), 1),
+    //     //         ScalarArg::new(resized_width),
+    //     //         ScalarArg::new(resized_height),
+    //     //         ScalarArg::new(width),
+    //     //         ScalarArg::new(height),
+    //     //     );
+    //     // };
+    //     (resized, resized_width, resized_height)
+    // };
 
     let (repacked, repacked_width, repacked_height) = {
         // let _t = timer("repack");
