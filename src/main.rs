@@ -34,10 +34,7 @@ mod gpu {
             terminate!();
         }
 
-        let offset = pos % 32;
-        let idx = pos / 32;
-        let overlay = (edge[idx] >> (31 - offset)) & 0x1;
-        if overlay == 1 {
+        if edge[pos] == 255 {
             image[pos] = 0;
         }
     }
@@ -419,18 +416,18 @@ impl VideoStream {
         process
             .args(["-re"])
             .args(["-loglevel", "error"])
-            // .args(["-hwaccel", "vaapi"])
-            // .args(["-hwaccel_output_format", "vaapi"])
+            .args(["-hwaccel", "vaapi"])
+            .args(["-hwaccel_output_format", "vaapi"])
             .args(["-i", path])
-            // .args([
-            //     "-vf",
-            //     format!("scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=rgba")
-            //         .as_str(),
-            // ])
             .args([
                 "-vf",
-                format!("scale=w={width}:h={height},format=rgba").as_str(),
+                format!("scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=rgba")
+                    .as_str(),
             ])
+            // .args([
+            //     "-vf",
+            //     format!("scale=w={width}:h={height},format=rgba").as_str(),
+            // ])
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", "rgba"])
             .args(["pipe:"])
@@ -474,17 +471,13 @@ fn get_cube_count(shape: [u32; 3], tiling: CubeDim) -> CubeCount {
 }
 
 mod edge {
-    use rayon::iter::{
-        IndexedParallelIterator, IntoParallelRefIterator as _, IntoParallelRefMutIterator,
-        ParallelIterator,
-    };
+    use crate::get_cube_count;
 
-    fn compute_histogram(image: &image::GrayImage) -> [u32; 256] {
-        let mut hist = [0u32; 256];
-        for pixel in image.pixels() {
-            let value = pixel.0[0];
-            hist[value as usize] += 1;
-        }
+    fn compute_histogram(image: &[u32]) -> [u32; 256] {
+        let mut hist = [0; 256];
+        image.iter().for_each(|&pixel| {
+            hist[pixel as usize] += 1;
+        });
         hist
     }
 
@@ -523,7 +516,7 @@ mod edge {
         if threshold == 0 { 1 } else { threshold }
     }
 
-    pub fn otsu_thresholding(image: &image::GrayImage) -> (u8, u8) {
+    pub fn otsu_thresholding(image: &[u32]) -> (u8, u8) {
         let mut hist = compute_histogram(image);
 
         for i in 1..255 {
@@ -538,57 +531,255 @@ mod edge {
         (th1.min(254.0) as u8, th2.min(254.0) as u8)
     }
 
-    pub fn canny(
-        gray_image: &[u8],
-        width: u32,
-        height: u32,
-        low_threshold: u8,
-        high_threshold: u8,
-    ) -> Vec<u8> {
-        let width = width as usize;
-        let height = height as usize;
-        let len = width * height;
+    // fn guassian_blur(blurred: &mut [u8], image: &[u8], kernel: &[u32], width: u32, height: u32) {
+    //     let width = width as usize;
+    //     let height = height as usize;
+    //     blurred
+    //         .par_iter_mut()
+    //         .enumerate()
+    //         .for_each(|(idx, blurred)| {
+    //             let y = idx / width;
+    //             let x = idx % width;
+    //             if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+    //                 return;
+    //             }
+    //             let mut sum = 0;
+    //             for ky in 0..3 {
+    //                 for kx in 0..3 {
+    //                     let idx = (y + ky - 1) * width + (x + kx - 1);
+    //                     sum += image[idx] as usize * kernel[ky * 3 + kx] as usize;
+    //                 }
+    //             }
+    //             *blurred = (sum / 16) as u8;
+    //         });
+    // }
 
-        // 1. 高斯滤波
-        let mut blurred = vec![0u8; len];
-        let gauss_kernel = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+    // fn compute_gradients(
+    //     gradients: &mut [f32],
+    //     directions: &mut [f32],
+    //     blurred: &[u8],
+    //     sobel_x: &[i32],
+    //     sobel_y: &[i32],
+    //     width: u32,
+    //     height: u32,
+    // ) {
+    //     let width = width as usize;
+    //     let height = height as usize;
+    //     rayon::iter::IndexedParallelIterator::zip(
+    //         gradients.par_iter_mut(),
+    //         directions.par_iter_mut(),
+    //     )
+    //     .enumerate()
+    //     .for_each(|(idx, (gradients, directions))| {
+    //         let y = idx / width;
+    //         let x = idx % width;
+    //         if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+    //             return;
+    //         }
+    //         let mut gx = 0;
+    //         let mut gy = 0;
 
-        blurred
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(idx, blurred)| {
-                let y = idx / width;
-                let x = idx % width;
-                if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
-                    return;
-                }
-                let mut sum = 0;
-                for ky in 0..3 {
-                    for kx in 0..3 {
-                        let idx = (y + ky - 1) * width + (x + kx - 1);
-                        sum += gray_image[idx] as usize * gauss_kernel[ky * 3 + kx];
-                    }
-                }
-                *blurred = (sum / 16) as u8;
-            });
+    //         for ky in 0..3 {
+    //             for kx in 0..3 {
+    //                 let idx = (y + ky - 1) * width + (x + kx - 1);
+    //                 gx += blurred[idx] as i32 * sobel_x[ky * 3 + kx];
+    //                 gy += blurred[idx] as i32 * sobel_y[ky * 3 + kx];
+    //             }
+    //         }
 
-        // 2. 计算梯度
-        let mut gradients = vec![0f32; len];
-        let mut directions = vec![0f32; len];
-        let sobel_x = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
-        let sobel_y = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
+    //         *gradients = ((gx * gx + gy * gy) as f32).sqrt();
+    //         *directions = (gy as f32).atan2(gx as f32);
+    //     });
+    // }
 
-        rayon::iter::IndexedParallelIterator::zip(
-            gradients.par_iter_mut(),
-            directions.par_iter_mut(),
-        )
-        .enumerate()
-        .for_each(|(idx, (gradients, directions))| {
-            let y = idx / width;
-            let x = idx % width;
+    // fn non_maximum_suppression(
+    //     suppressed: &mut [u8],
+    //     gradients: &[f32],
+    //     directions: &[f32],
+    //     width: u32,
+    //     height: u32,
+    // ) {
+    //     let width = width as usize;
+    //     let height = height as usize;
+    //     suppressed
+    //         .par_iter_mut()
+    //         .enumerate()
+    //         .for_each(|(idx, suppressed)| {
+    //             let y = idx / width;
+    //             let x = idx % width;
+    //             if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+    //                 return;
+    //             }
+
+    //             let angle = directions[idx];
+    //             let grad = gradients[idx];
+
+    //             // 量化方向到0°,45°,90°,135°
+    //             let quantized = if angle < -3.0 * std::f32::consts::PI / 8.0 {
+    //                 0
+    //             } else if angle < -std::f32::consts::PI / 8.0 {
+    //                 1
+    //             } else if angle < std::f32::consts::PI / 8.0 {
+    //                 0
+    //             } else if angle < 3.0 * std::f32::consts::PI / 8.0 {
+    //                 3
+    //             } else {
+    //                 2
+    //             };
+
+    //             let (dx1, dy1, dx2, dy2) = match quantized {
+    //                 0 => (1, 0, -1, 0),
+    //                 1 => (1, 1, -1, -1),
+    //                 2 => (0, 1, 0, -1),
+    //                 3 => (-1, 1, 1, -1),
+    //                 _ => (0, 0, 0, 0),
+    //             };
+
+    //             let neighbor1 = gradients[((y as i32 + dy1) * width as i32 + (x as i32 + dx1))
+    //                 .clamp(0, i32::MAX) as usize];
+    //             let neighbor2 = gradients[((y as i32 + dy2) * width as i32 + (x as i32 + dx2))
+    //                 .clamp(0, i32::MAX) as usize];
+
+    //             if grad >= neighbor1 && grad >= neighbor2 {
+    //                 *suppressed = grad as u8;
+    //             }
+    //         });
+    // }
+
+    // fn hysteresis_strong(edges: &mut [u8], suppressed: &[u8], width: u32, height: u32, high: u32) {
+    //     let width = width as usize;
+    //     let height = height as usize;
+    //     let high = high as u8;
+
+    //     rayon::iter::IndexedParallelIterator::zip(edges.par_iter_mut(), suppressed.par_iter())
+    //         .enumerate()
+    //         .for_each(|(idx, (edges, suppressed))| {
+    //             let y = idx / width;
+    //             let x = idx % width;
+    //             if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+    //                 return;
+    //             }
+    //             if *suppressed >= high {
+    //                 *edges = 255;
+    //             }
+    //         });
+    // }
+
+    // fn hysteresis_weak(edges: &mut [u8], suppressed: &[u8], width: u32, height: u32, low: u32) {
+    //     let low = low as u8;
+
+    //     for y in 1..height - 1 {
+    //         for x in 1..width - 1 {
+    //             let idx = (y * width + x) as usize;
+    //             if suppressed[idx] >= low && edges[idx] == 0 {
+    //                 // 检查8邻域是否有强边缘
+    //                 for ky in -1..=1 {
+    //                     for kx in -1..=1 {
+    //                         if ky == 0 && kx == 0 {
+    //                             continue;
+    //                         }
+    //                         let nidx = (y as i32 + ky) as usize * width as usize
+    //                             + (x as i32 + kx) as usize;
+    //                         if edges[nidx] == 255 {
+    //                             edges[idx] = 255;
+    //                             break;
+    //                         }
+    //                     }
+    //                     if edges[idx] == 255 {
+    //                         break;
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+
+    #[no_implicit_prelude]
+    mod gpu {
+        extern crate cubecl;
+        extern crate std;
+
+        use cubecl::prelude::*;
+        use std::clone::Clone;
+        use std::convert::Into;
+        use std::default::Default;
+
+        #[cube(launch)]
+        pub fn guassian_blur(
+            blurred: &mut Array<u32>,
+            image: &Array<u32>,
+            kernel: &Array<u32>,
+            width: u32,
+            height: u32,
+        ) {
+            let y = ABSOLUTE_POS_Y;
+            let x = ABSOLUTE_POS_X;
             if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
-                return;
+                terminate!();
             }
+            let idx = y * width + x;
+            let mut sum = 0;
+            for ky in 0..3 {
+                for kx in 0..3 {
+                    let idx = (y + ky - 1) * width + (x + kx - 1);
+                    sum += image[idx] * kernel[ky * 3 + kx];
+                }
+            }
+            blurred[idx] = sum / 16;
+        }
+
+        #[cube]
+        fn atan(x: f32) -> f32 {
+            let x2 = x * x;
+            let mut sum = x;
+            let mut term = x;
+            let mut n = u32::new(1);
+
+            // 迭代次数可调
+            while n < 5 {
+                term = -term * x2;
+                sum += term / (2 * n + 1) as f32;
+                n += 1;
+            }
+            sum
+        }
+
+        #[cube]
+        fn atan2(y: f32, x: f32) -> f32 {
+            if x > 0.0 {
+                atan(y / x)
+            } else if x < 0.0 {
+                let at = atan(y / x);
+                if y >= 0.0 {
+                    at + 3.141592653589793
+                } else {
+                    at - 3.141592653589793
+                }
+            } else if y > 0.0 {
+                f32::new(1.5707963267948966)
+            } else if y < 0.0 {
+                f32::new(-1.5707963267948966)
+            } else {
+                f32::new(0.0)
+            }
+        }
+
+        #[cube(launch)]
+        pub fn compute_gradients(
+            gradients: &mut Array<f32>,
+            directions: &mut Array<f32>,
+            blurred: &Array<u32>,
+            sobel_x: &Array<i32>,
+            sobel_y: &Array<i32>,
+            width: u32,
+            height: u32,
+        ) {
+            let y = ABSOLUTE_POS_Y;
+            let x = ABSOLUTE_POS_X;
+            if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+                terminate!();
+            }
+            let idx = y * width + x;
             let mut gx = 0;
             let mut gy = 0;
 
@@ -600,97 +791,240 @@ mod edge {
                 }
             }
 
-            *gradients = ((gx * gx + gy * gy) as f32).sqrt();
-            *directions = (gy as f32).atan2(gx as f32);
-        });
+            gradients[idx] = f32::sqrt((gx * gx + gy * gy) as f32);
+            directions[idx] = atan2(gy as f32, gx as f32);
+        }
 
-        // 3. 非极大值抑制
-        let mut suppressed = vec![0u8; len];
+        #[cube(launch)]
+        pub fn non_maximum_suppression(
+            suppressed: &mut Array<u32>,
+            gradients: &Array<f32>,
+            directions: &Array<f32>,
+            width: u32,
+            height: u32,
+        ) {
+            let y = ABSOLUTE_POS_Y;
+            let x = ABSOLUTE_POS_X;
+            if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+                terminate!();
+            }
+            let idx = y * width + x;
 
-        suppressed
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(idx, suppressed)| {
-                let y = idx / width;
-                let x = idx % width;
-                if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
-                    return;
-                }
+            let angle = directions[idx];
+            let grad = gradients[idx];
 
-                let angle = directions[idx];
-                let grad = gradients[idx];
+            let mut dx1 = 0i32;
+            let mut dy1 = 0i32;
+            let mut dx2 = 0i32;
+            let mut dy2 = 0i32;
 
-                // 量化方向到0°,45°,90°,135°
-                let quantized = if angle < -3.0 * std::f32::consts::PI / 8.0 {
-                    0
-                } else if angle < -std::f32::consts::PI / 8.0 {
-                    1
-                } else if angle < std::f32::consts::PI / 8.0 {
-                    0
-                } else if angle < 3.0 * std::f32::consts::PI / 8.0 {
-                    3
-                } else {
-                    2
-                };
+            // 量化方向到0°,45°,90°,135°
+            if angle < -3.0 * std::f32::consts::PI / 8.0 {
+                dx1 = 1;
+                dy1 = 0;
+                dx2 = -1;
+                dy2 = 0;
+            } else if angle < -std::f32::consts::PI / 8.0 {
+                dx1 = 1;
+                dy1 = 1;
+                dx2 = -1;
+                dy2 = -1;
+            } else if angle < std::f32::consts::PI / 8.0 {
+                dx1 = 1;
+                dy1 = 0;
+                dx2 = -1;
+                dy2 = 0;
+            } else if angle < 3.0 * std::f32::consts::PI / 8.0 {
+                dx1 = -1;
+                dy1 = 1;
+                dx2 = 1;
+                dy2 = -1;
+            } else {
+                dx1 = 0;
+                dy1 = 1;
+                dx2 = 0;
+                dy2 = -1;
+            };
 
-                let (dx1, dy1, dx2, dy2) = match quantized {
-                    0 => (1, 0, -1, 0),
-                    1 => (1, 1, -1, -1),
-                    2 => (0, 1, 0, -1),
-                    3 => (-1, 1, 1, -1),
-                    _ => (0, 0, 0, 0),
-                };
+            let neighbor1 =
+                gradients[i32::max((y as i32 + dy1) * width as i32 + (x as i32 + dx1), 0) as u32];
+            let neighbor2 =
+                gradients[i32::max((y as i32 + dy2) * width as i32 + (x as i32 + dx2), 0) as u32];
 
-                let neighbor1 = gradients[((y as i32 + dy1) * width as i32 + (x as i32 + dx1))
-                    .clamp(0, i32::MAX) as usize];
-                let neighbor2 = gradients[((y as i32 + dy2) * width as i32 + (x as i32 + dx2))
-                    .clamp(0, i32::MAX) as usize];
+            if grad >= neighbor1 && grad >= neighbor2 {
+                suppressed[idx] = grad as u32;
+            } else {
+                suppressed[idx] = 0;
+            }
+        }
 
-                if grad >= neighbor1 && grad >= neighbor2 {
-                    *suppressed = grad as u8;
-                }
-            });
+        #[cube(launch)]
+        pub fn hysteresis_strong(
+            edges: &mut Array<u32>,
+            suppressed: &Array<u32>,
+            len: u32,
+            high: u32,
+        ) {
+            let idx = ABSOLUTE_POS;
+            if idx >= len {
+                terminate!();
+            }
+            if suppressed[idx] >= high {
+                edges[idx] = 255;
+            } else {
+                edges[idx] = 0;
+            }
+        }
 
-        // 4. 双阈值检测
-        let mut edges = vec![0u8; len];
-
-        rayon::iter::IndexedParallelIterator::zip(edges.par_iter_mut(), suppressed.par_iter())
-            .enumerate()
-            .for_each(|(idx, (edges, suppressed))| {
-                let y = idx / width;
-                let x = idx % width;
-                if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
-                    return;
-                }
-                if *suppressed >= high_threshold {
-                    *edges = 255;
-                }
-            });
-
-        for _ in 0..5 {
-            for y in 1..height - 1 {
-                for x in 1..width - 1 {
-                    let idx = y * width + x;
-                    if suppressed[idx] >= low_threshold && edges[idx] == 0 {
-                        // 检查8邻域是否有强边缘
-                        for ky in -1..=1 {
-                            for kx in -1..=1 {
-                                if ky == 0 && kx == 0 {
-                                    continue;
-                                }
-                                let nidx =
-                                    (y as i32 + ky) as usize * width + (x as i32 + kx) as usize;
-                                if edges[nidx] == 255 {
-                                    edges[idx] = 255;
-                                    break;
-                                }
-                            }
-                            if edges[idx] == 255 {
+        #[cube(launch)]
+        pub fn hysteresis_weak(
+            edges: &mut Array<u32>,
+            suppressed: &Array<u32>,
+            width: u32,
+            height: u32,
+            low: u32,
+        ) {
+            let y = ABSOLUTE_POS_Y;
+            let x = ABSOLUTE_POS_X;
+            if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+                terminate!();
+            }
+            let idx = y * width + x;
+            if suppressed[idx] >= low && edges[idx] == 0 {
+                // 检查8邻域是否有强边缘
+                for ky in -1..=1 {
+                    for kx in -1..=1 {
+                        if ky != 0 || kx != 0 {
+                            let nidx = (y as i32 + ky) * width as i32 + (x as i32 + kx);
+                            if edges[nidx as u32] == 255 {
+                                edges[idx] = 255;
                                 break;
                             }
                         }
                     }
+                    if edges[idx] == 255 {
+                        break;
+                    }
                 }
+            }
+        }
+    }
+
+    pub fn canny<RT: cubecl::Runtime>(
+        client: &cubecl::client::ComputeClient<RT::Server, RT::Channel>,
+        image: cubecl::server::Handle,
+        width: u32,
+        height: u32,
+        low_threshold: u32,
+        high_threshold: u32,
+    ) -> cubecl::server::Handle {
+        use cubecl::prelude::*;
+
+        let tiling = CubeDim::new_2d(16, 16);
+
+        let len = (width * height) as usize;
+
+        let blurred = client.empty(size_of::<u32>() * len);
+        let kernel = client.create(u32::as_bytes(&[1, 2, 1, 2, 4, 2, 1, 2, 1]));
+        unsafe {
+            gpu::guassian_blur::launch::<RT>(
+                client,
+                get_cube_count([width, height, 1], tiling),
+                tiling,
+                ArrayArg::from_raw_parts::<u32>(&blurred, len, 1),
+                ArrayArg::from_raw_parts::<u32>(&image, len, 1),
+                ArrayArg::from_raw_parts::<u32>(&kernel, 9, 1),
+                ScalarArg::new(width),
+                ScalarArg::new(height),
+            );
+        }
+
+        // 1. 高斯滤波
+        // let mut blurred = vec![0u8; len];
+        // let gauss_kernel = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+        // guassian_blur(&mut blurred, &gray_image, &gauss_kernel, width, height);
+        // let blurred = blurred.into_iter().map(|x| x as u32).collect::<Vec<_>>();
+        // let blurred = client.create(u32::as_bytes(&blurred));
+
+        let gradients = client.empty(size_of::<f32>() * len);
+        let directions = client.empty(size_of::<f32>() * len);
+        let sobel_x = client.create(i32::as_bytes(&[-1, 0, 1, -2, 0, 2, -1, 0, 1]));
+        let sobel_y = client.create(i32::as_bytes(&[-1, -2, -1, 0, 0, 0, 1, 2, 1]));
+        unsafe {
+            gpu::compute_gradients::launch::<RT>(
+                client,
+                get_cube_count([width, height, 1], tiling),
+                tiling,
+                ArrayArg::from_raw_parts::<f32>(&gradients, len, 1),
+                ArrayArg::from_raw_parts::<f32>(&directions, len, 1),
+                ArrayArg::from_raw_parts::<u32>(&blurred, len, 1),
+                ArrayArg::from_raw_parts::<i32>(&sobel_x, 9, 1),
+                ArrayArg::from_raw_parts::<i32>(&sobel_y, 9, 1),
+                ScalarArg::new(width),
+                ScalarArg::new(height),
+            )
+        }
+
+        // // 2. 计算梯度
+        // let mut gradients = vec![0f32; len];
+        // let mut directions = vec![0f32; len];
+        // let sobel_x = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
+        // let sobel_y = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
+        // compute_gradients(
+        //     &mut gradients,
+        //     &mut directions,
+        //     &blurred,
+        //     &sobel_x,
+        //     &sobel_y,
+        //     width,
+        //     height,
+        // );
+        // let gradients = client.create(f32::as_bytes(&gradients));
+        // let directions = client.create(f32::as_bytes(&directions));
+
+        // 3. 非极大值抑制
+        // let mut suppressed = vec![0u8; len];
+        let suppressed = client.empty(size_of::<u32>() * len);
+        unsafe {
+            gpu::non_maximum_suppression::launch::<RT>(
+                client,
+                get_cube_count([width, height, 1], tiling),
+                tiling,
+                ArrayArg::from_raw_parts::<u32>(&suppressed, len, 1),
+                ArrayArg::from_raw_parts::<u32>(&gradients, len, 1),
+                ArrayArg::from_raw_parts::<u32>(&directions, len, 1),
+                ScalarArg::new(width),
+                ScalarArg::new(height),
+            );
+        }
+        // non_maximum_suppression(&mut suppressed, &gradients, &directions, width, height);
+
+        let edges = client.empty(size_of::<u32>() * len);
+
+        unsafe {
+            gpu::hysteresis_strong::launch::<RT>(
+                client,
+                get_cube_count([len as u32, 1, 1], CubeDim::new(256, 1, 1)),
+                CubeDim::new(256, 1, 1),
+                ArrayArg::from_raw_parts::<u32>(&edges, len, 1),
+                ArrayArg::from_raw_parts::<u32>(&suppressed, len, 1),
+                ScalarArg::new(len as u32),
+                ScalarArg::new(high_threshold),
+            );
+        }
+
+        for _ in 0..5 {
+            unsafe {
+                gpu::hysteresis_weak::launch::<RT>(
+                    client,
+                    get_cube_count([width, height, 1], tiling),
+                    tiling,
+                    ArrayArg::from_raw_parts::<u32>(&edges, len, 1),
+                    ArrayArg::from_raw_parts::<u32>(&suppressed, len, 1),
+                    ScalarArg::new(width),
+                    ScalarArg::new(height),
+                    ScalarArg::new(low_threshold),
+                );
             }
         }
 
@@ -714,32 +1048,45 @@ async fn render<RT: cubecl::prelude::Runtime>(
     let resized = client.create(data);
     let (resized_width, resized_height) = (width, height);
 
-    let data_vec = data.to_owned();
-    let edges = compio::runtime::spawn_blocking(move || {
-        let raw_img = image::RgbaImage::from_raw(width, height, data_vec).unwrap();
-        let dynamic_img = image::DynamicImage::ImageRgba8(raw_img);
-        let gray_img: image::GrayImage = dynamic_img.to_luma8();
-        let (canny_low, canny_high) = edge::otsu_thresholding(&gray_img);
-        let edges = edge::canny(gray_img.as_raw(), width, height, canny_low, canny_high);
-        // let edges = imageproc::edges::canny(&gray_img, canny_low as f32, canny_high as f32);
-        // edges.into_iter().map(|&px| px as u32).collect::<Vec<_>>()
-        edges
-            .chunks(32)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|&val| match val {
-                        255 => 1,
-                        _ => 0,
-                    })
-                    .fold(0u32, |acc, b| (acc << 1) | b)
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap();
+    let edges = {
+        let single_channel_image =
+            client.empty(size_of::<u32>() * (resized_width * resized_height) as usize);
+        unsafe {
+            gpu::compute_brightness::launch::<RT>(
+                client,
+                get_cube_count([resized_width, resized_height, 1], tiling),
+                tiling,
+                ArrayArg::from_raw_parts::<u32>(
+                    &single_channel_image,
+                    (resized_height * resized_width) as usize,
+                    1,
+                ),
+                ArrayArg::from_raw_parts::<u32>(
+                    &resized,
+                    (resized_height * resized_width) as usize,
+                    1,
+                ),
+                ScalarArg::new(resized_width),
+                ScalarArg::new(resized_height),
+            );
+        }
+        let brightness_image = u32::from_bytes(
+            &client
+                .read_one_async(single_channel_image.clone().binding())
+                .await,
+        )
+        .to_owned();
+        let (canny_low, canny_high) = edge::otsu_thresholding(&brightness_image);
+        edge::canny::<RT>(
+            client,
+            single_channel_image,
+            width,
+            height,
+            canny_low as u32,
+            canny_high as u32,
+        )
+    };
 
-    let edge = client.create(u32::as_bytes(&edges));
     unsafe {
         let len = resized_width * resized_height;
         gpu::overlay_edge::launch::<RT>(
@@ -747,7 +1094,7 @@ async fn render<RT: cubecl::prelude::Runtime>(
             CubeCount::new_1d(len.div_ceil(256)),
             CubeDim::new_1d(256),
             ArrayArg::from_raw_parts::<u32>(&resized, len as usize, 1),
-            ArrayArg::from_raw_parts::<u32>(&edge, edges.len(), 1),
+            ArrayArg::from_raw_parts::<u32>(&edges, len as usize, 1),
             ScalarArg::new(len),
         );
     }
