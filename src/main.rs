@@ -419,18 +419,18 @@ impl VideoStream {
         process
             .args(["-re"])
             .args(["-loglevel", "error"])
-            .args(["-hwaccel", "vaapi"])
-            .args(["-hwaccel_output_format", "vaapi"])
+            // .args(["-hwaccel", "vaapi"])
+            // .args(["-hwaccel_output_format", "vaapi"])
             .args(["-i", path])
-            .args([
-                "-vf",
-                format!("scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=rgba")
-                    .as_str(),
-            ])
             // .args([
             //     "-vf",
-            //     format!("scale=w={width}:h={height},format=rgba").as_str(),
+            //     format!("scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=rgba")
+            //         .as_str(),
             // ])
+            .args([
+                "-vf",
+                format!("scale=w={width}:h={height},format=rgba").as_str(),
+            ])
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", "rgba"])
             .args(["pipe:"])
@@ -474,6 +474,10 @@ fn get_cube_count(shape: [u32; 3], tiling: CubeDim) -> CubeCount {
 }
 
 mod edge {
+    use rayon::iter::{
+        IndexedParallelIterator, IntoParallelRefIterator as _, IntoParallelRefMutIterator,
+        ParallelIterator,
+    };
 
     fn compute_histogram(image: &image::GrayImage) -> [u32; 256] {
         let mut hist = [0u32; 256];
@@ -519,7 +523,7 @@ mod edge {
         if threshold == 0 { 1 } else { threshold }
     }
 
-    pub fn otsu_thresholding(image: &image::GrayImage) -> (f32, f32) {
+    pub fn otsu_thresholding(image: &image::GrayImage) -> (u8, u8) {
         let mut hist = compute_histogram(image);
 
         for i in 1..255 {
@@ -531,7 +535,166 @@ mod edge {
         let th1 = th_otsu * 0.7;
         let th2 = th_otsu * 1.1;
 
-        (th1.min(254.0), th2.min(254.0))
+        (th1.min(254.0) as u8, th2.min(254.0) as u8)
+    }
+
+    pub fn canny(
+        gray_image: &[u8],
+        width: u32,
+        height: u32,
+        low_threshold: u8,
+        high_threshold: u8,
+    ) -> Vec<u8> {
+        let width = width as usize;
+        let height = height as usize;
+        let len = width * height;
+
+        // 1. 高斯滤波
+        let mut blurred = vec![0u8; len];
+        let gauss_kernel = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+
+        blurred
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(idx, blurred)| {
+                let y = idx / width;
+                let x = idx % width;
+                if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+                    return;
+                }
+                let mut sum = 0;
+                for ky in 0..3 {
+                    for kx in 0..3 {
+                        let idx = (y + ky - 1) * width + (x + kx - 1);
+                        sum += gray_image[idx] as usize * gauss_kernel[ky * 3 + kx];
+                    }
+                }
+                *blurred = (sum / 16) as u8;
+            });
+
+        // 2. 计算梯度
+        let mut gradients = vec![0f32; len];
+        let mut directions = vec![0f32; len];
+        let sobel_x = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
+        let sobel_y = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
+
+        rayon::iter::IndexedParallelIterator::zip(
+            gradients.par_iter_mut(),
+            directions.par_iter_mut(),
+        )
+        .enumerate()
+        .for_each(|(idx, (gradients, directions))| {
+            let y = idx / width;
+            let x = idx % width;
+            if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+                return;
+            }
+            let mut gx = 0;
+            let mut gy = 0;
+
+            for ky in 0..3 {
+                for kx in 0..3 {
+                    let idx = (y + ky - 1) * width + (x + kx - 1);
+                    gx += blurred[idx] as i32 * sobel_x[ky * 3 + kx];
+                    gy += blurred[idx] as i32 * sobel_y[ky * 3 + kx];
+                }
+            }
+
+            *gradients = ((gx * gx + gy * gy) as f32).sqrt();
+            *directions = (gy as f32).atan2(gx as f32);
+        });
+
+        // 3. 非极大值抑制
+        let mut suppressed = vec![0u8; len];
+
+        suppressed
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(idx, suppressed)| {
+                let y = idx / width;
+                let x = idx % width;
+                if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+                    return;
+                }
+
+                let angle = directions[idx];
+                let grad = gradients[idx];
+
+                // 量化方向到0°,45°,90°,135°
+                let quantized = if angle < -3.0 * std::f32::consts::PI / 8.0 {
+                    0
+                } else if angle < -std::f32::consts::PI / 8.0 {
+                    1
+                } else if angle < std::f32::consts::PI / 8.0 {
+                    0
+                } else if angle < 3.0 * std::f32::consts::PI / 8.0 {
+                    3
+                } else {
+                    2
+                };
+
+                let (dx1, dy1, dx2, dy2) = match quantized {
+                    0 => (1, 0, -1, 0),
+                    1 => (1, 1, -1, -1),
+                    2 => (0, 1, 0, -1),
+                    3 => (-1, 1, 1, -1),
+                    _ => (0, 0, 0, 0),
+                };
+
+                let neighbor1 = gradients[((y as i32 + dy1) * width as i32 + (x as i32 + dx1))
+                    .clamp(0, i32::MAX) as usize];
+                let neighbor2 = gradients[((y as i32 + dy2) * width as i32 + (x as i32 + dx2))
+                    .clamp(0, i32::MAX) as usize];
+
+                if grad >= neighbor1 && grad >= neighbor2 {
+                    *suppressed = grad as u8;
+                }
+            });
+
+        // 4. 双阈值检测
+        let mut edges = vec![0u8; len];
+
+        rayon::iter::IndexedParallelIterator::zip(edges.par_iter_mut(), suppressed.par_iter())
+            .enumerate()
+            .for_each(|(idx, (edges, suppressed))| {
+                let y = idx / width;
+                let x = idx % width;
+                if y < 1 || y >= height - 1 || x < 1 || x >= width - 1 {
+                    return;
+                }
+                if *suppressed >= high_threshold {
+                    *edges = 255;
+                }
+            });
+
+        for _ in 0..5 {
+            for y in 1..height - 1 {
+                for x in 1..width - 1 {
+                    let idx = y * width + x;
+                    if suppressed[idx] >= low_threshold && edges[idx] == 0 {
+                        // 检查8邻域是否有强边缘
+                        for ky in -1..=1 {
+                            for kx in -1..=1 {
+                                if ky == 0 && kx == 0 {
+                                    continue;
+                                }
+                                let nidx =
+                                    (y as i32 + ky) as usize * width + (x as i32 + kx) as usize;
+                                if edges[nidx] == 255 {
+                                    edges[idx] = 255;
+                                    break;
+                                }
+                            }
+                            if edges[idx] == 255 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        edges
     }
 }
 
@@ -557,7 +720,8 @@ async fn render<RT: cubecl::prelude::Runtime>(
         let dynamic_img = image::DynamicImage::ImageRgba8(raw_img);
         let gray_img: image::GrayImage = dynamic_img.to_luma8();
         let (canny_low, canny_high) = edge::otsu_thresholding(&gray_img);
-        let edges = imageproc::edges::canny(&gray_img, canny_low, canny_high);
+        let edges = edge::canny(gray_img.as_raw(), width, height, canny_low, canny_high);
+        // let edges = imageproc::edges::canny(&gray_img, canny_low as f32, canny_high as f32);
         // edges.into_iter().map(|&px| px as u32).collect::<Vec<_>>()
         edges
             .chunks(32)
