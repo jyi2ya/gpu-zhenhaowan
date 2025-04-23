@@ -416,18 +416,18 @@ impl VideoStream {
         process
             .args(["-re"])
             .args(["-loglevel", "error"])
-            // .args(["-hwaccel", "vaapi"])
-            // .args(["-hwaccel_output_format", "vaapi"])
+            .args(["-hwaccel", "vaapi"])
+            .args(["-hwaccel_output_format", "vaapi"])
             .args(["-i", path])
-            // .args([
-            //     "-vf",
-            //     format!("scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=rgba")
-            //         .as_str(),
-            // ])
             .args([
                 "-vf",
-                format!("scale=w={width}:h={height},format=rgba").as_str(),
+                format!("scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=rgba")
+                    .as_str(),
             ])
+            // .args([
+            //     "-vf",
+            //     format!("scale=w={width}:h={height},format=rgba").as_str(),
+            // ])
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", "rgba"])
             .args(["pipe:"])
@@ -471,22 +471,17 @@ fn get_cube_count(shape: [u32; 3], tiling: CubeDim) -> CubeCount {
 }
 
 mod edge {
-    use rayon::prelude::*;
-    use std::sync::atomic::AtomicU32;
-
-    use crossbeam_utils::CachePadded;
-
     use crate::get_cube_count;
 
-    fn compute_histogram(image: &[u32]) -> [u32; 256] {
-        let hist = std::array::from_fn(|_| CachePadded::new(AtomicU32::new(0)));
-        image.par_iter().for_each(|&pixel| {
-            hist[pixel as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        });
-        hist.map(|x| x.into_inner().into_inner())
-    }
+    // fn compute_histogram(image: &[u32]) -> [u32; 256] {
+    //     let hist = std::array::from_fn(|_| CachePadded::new(AtomicU32::new(0)));
+    //     image.par_iter().for_each(|&pixel| {
+    //         hist[pixel as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    //     });
+    //     hist.map(|x| x.into_inner().into_inner())
+    // }
 
-    fn otsu_threshold(hist: &[u32; 256]) -> u8 {
+    fn otsu_threshold(hist: &[u32]) -> u8 {
         let total_pixels = hist.iter().sum::<u32>() as f64;
         let mut cumulative_sum = [0u32; 256];
         cumulative_sum[0] = hist[0];
@@ -521,9 +516,7 @@ mod edge {
         if threshold == 0 { 1 } else { threshold }
     }
 
-    pub fn otsu_thresholding(image: &[u32]) -> (u8, u8) {
-        let mut hist = compute_histogram(image);
-
+    pub fn otsu_thresholding(hist: &mut [u32]) -> (u8, u8) {
         for i in 1..255 {
             hist[i] = (hist[i - 1] + hist[i] * 2 + hist[i + 1]) / 4;
         }
@@ -700,7 +693,7 @@ mod edge {
     // }
 
     #[no_implicit_prelude]
-    mod gpu {
+    pub mod gpu {
         extern crate cubecl;
         extern crate std;
 
@@ -708,6 +701,15 @@ mod edge {
         use std::clone::Clone;
         use std::convert::Into;
         use std::default::Default;
+
+        #[cube(launch)]
+        pub fn compute_histogram(hist: &mut Array<Atomic<u32>>, image: &Array<u32>, len: u32) {
+            let pos = ABSOLUTE_POS;
+            if pos >= len {
+                terminate!();
+            }
+            Atomic::add(&hist[image[pos]], 1);
+        }
 
         #[cube(launch)]
         pub fn guassian_blur(
@@ -1075,13 +1077,20 @@ async fn render<RT: cubecl::prelude::Runtime>(
                 ScalarArg::new(resized_height),
             );
         }
-        let brightness_image = u32::from_bytes(
-            &client
-                .read_one_async(single_channel_image.clone().binding())
-                .await,
-        )
-        .to_owned();
-        let (canny_low, canny_high) = edge::otsu_thresholding(&brightness_image);
+        let hist = client.create(u32::as_bytes(&[0; 256]));
+        let len = resized_height * resized_width;
+        unsafe {
+            edge::gpu::compute_histogram::launch::<RT>(
+                client,
+                get_cube_count([len, 1, 1], CubeDim::new_1d(256)),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts::<u32>(&hist, len as usize, 1),
+                ArrayArg::from_raw_parts::<u32>(&single_channel_image, len as usize, 1),
+                ScalarArg::new(len),
+            )
+        }
+        let mut hist = u32::from_bytes(&client.read_one_async(hist.binding()).await).to_owned();
+        let (canny_low, canny_high) = edge::otsu_thresholding(&mut hist);
         edge::canny::<RT>(
             client,
             single_channel_image,
