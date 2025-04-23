@@ -416,18 +416,18 @@ impl VideoStream {
         process
             .args(["-re"])
             .args(["-loglevel", "error"])
-            .args(["-hwaccel", "vaapi"])
-            .args(["-hwaccel_output_format", "vaapi"])
+            // .args(["-hwaccel", "vaapi"])
+            // .args(["-hwaccel_output_format", "vaapi"])
             .args(["-i", path])
-            .args([
-                "-vf",
-                format!("scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=rgba")
-                    .as_str(),
-            ])
             // .args([
             //     "-vf",
-            //     format!("scale=w={width}:h={height},format=rgba").as_str(),
+            //     format!("scale_vaapi=w={width}:h={height}:format=nv12,hwdownload,format=rgba")
+            //         .as_str(),
             // ])
+            .args([
+                "-vf",
+                format!("scale=w={width}:h={height},format=rgba").as_str(),
+            ])
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", "rgba"])
             .args(["pipe:"])
@@ -471,14 +471,19 @@ fn get_cube_count(shape: [u32; 3], tiling: CubeDim) -> CubeCount {
 }
 
 mod edge {
+    use rayon::prelude::*;
+    use std::sync::atomic::AtomicU32;
+
+    use crossbeam_utils::CachePadded;
+
     use crate::get_cube_count;
 
     fn compute_histogram(image: &[u32]) -> [u32; 256] {
-        let mut hist = [0; 256];
-        image.iter().for_each(|&pixel| {
-            hist[pixel as usize] += 1;
+        let hist = std::array::from_fn(|_| CachePadded::new(AtomicU32::new(0)));
+        image.par_iter().for_each(|&pixel| {
+            hist[pixel as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         });
-        hist
+        hist.map(|x| x.into_inner().into_inner())
     }
 
     fn otsu_threshold(hist: &[u32; 256]) -> u8 {
