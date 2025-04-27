@@ -1356,28 +1356,41 @@ async fn main() -> anyhow::Result<()> {
     let char_width = 8;
     let char_height = 16;
 
-    let (tx, rx) = async_channel::bounded::<compio::runtime::Task<Result<_, _>>>(4);
+    let (tx, rx) = async_channel::bounded::<compio::runtime::Task<Result<_, _>>>(1);
 
     compio::runtime::spawn(async move {
-        let mut frames_rendered = 0u64;
-        let mut frames_dropped = 0u64;
+        let mut frames_rendered = 0;
+        let mut frames_dropped = 0;
         let start = std::time::Instant::now();
-        while let Ok(frame) = rx.recv().await {
-            if !frame.is_finished() && !rx.is_empty() {
+        let mut handles = Vec::new();
+        while let Ok(finished) = rx.recv().await {
+            handles.push(finished);
+            if handles.len() > 30 {
+                let _ = handles.remove(0);
                 frames_dropped += 1;
-                continue;
             }
-            let (term, palette) = frame.await.unwrap();
-            let now = std::time::Instant::now();
-            let duration = (now - start).as_secs_f64();
-            let screen = screen(term, palette, term_width, term_height);
-            let content = format!(
-                "{screen}ok, {duration:.2} secs, {frames_rendered} frames, {frames_dropped} dropped, {:.2}/{:.2} fps",
-                frames_rendered as f64 / duration,
-                (frames_rendered + frames_dropped) as f64 / duration,
-            );
-            compio::fs::stdout().write_all(content).await.unwrap();
-            frames_rendered += 1;
+
+            if rx.is_empty() {
+                if let Some(finished) = handles.iter().enumerate().find(|(_idx, task)| task.is_finished()).map(|(idx, _task)| idx) {
+                    let mut rest = handles.split_off(finished);
+                    let finished = rest.remove(0);
+                    frames_dropped += handles.len();
+                    handles = rest;
+
+                    let (term, palette) = finished.await.unwrap();
+                    let now = std::time::Instant::now();
+                    let duration = (now - start).as_secs_f64();
+                    let screen = screen(term, palette, term_width, term_height);
+                    let content = format!(
+                        "{screen}ok, {duration:.2} secs, {frames_rendered} frames, {frames_dropped} dropped, {:.2}/{:.2} fps",
+                        frames_rendered as f64 / duration,
+                        (frames_rendered + frames_dropped) as f64 / duration,
+                    );
+                    compio::fs::stdout().write_all(content).await.unwrap();
+                    frames_rendered += 1;
+                }
+
+            }
         }
     }).detach();
 
