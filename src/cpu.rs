@@ -26,19 +26,19 @@ pub fn bicubic_resize(
     src_height: u32,
 ) {
     // 验证输入参数有效性
-    assert!(dst.len() >= (dst_width * dst_height) as usize);
-    assert!(src.len() >= (src_width * src_height) as usize);
+    assert!(dst.len() >= ((dst_width * dst_height) as usize));
+    assert!(src.len() >= ((src_width * src_height) as usize));
 
     // 计算缩放比例
-    let x_ratio = src_width as f32 / dst_width as f32;
-    let y_ratio = src_height as f32 / dst_height as f32;
+    let x_ratio = (src_width as f32) / (dst_width as f32);
+    let y_ratio = (src_height as f32) / (dst_height as f32);
 
     // 遍历目标图像每个像素
     for y in 0..dst_height {
         for x in 0..dst_width {
             // 计算对应的源图像位置
-            let src_x = x as f32 * x_ratio;
-            let src_y = y as f32 * y_ratio;
+            let src_x = (x as f32) * x_ratio;
+            let src_y = (y as f32) * y_ratio;
 
             let x_floor = src_x.floor() as i32;
             let y_floor = src_y.floor() as i32;
@@ -51,18 +51,18 @@ pub fn bicubic_resize(
 
             for i in -1..3 {
                 for j in -1..3 {
-                    let px = (x_floor + i).clamp(0, src_width as i32 - 1) as u32;
-                    let py = (y_floor + j).clamp(0, src_height as i32 - 1) as u32;
+                    let px = (x_floor + i).clamp(0, (src_width as i32) - 1) as u32;
+                    let py = (y_floor + j).clamp(0, (src_height as i32) - 1) as u32;
 
                     let idx = (py * src_width + px) as usize;
-                    let weight_x = cubic_weight(src_x - (x_floor + i) as f32, -0.5);
-                    let weight_y = cubic_weight(src_y - (y_floor + j) as f32, -0.5);
+                    let weight_x = cubic_weight(src_x - ((x_floor + i) as f32), -0.5);
+                    let weight_y = cubic_weight(src_y - ((y_floor + j) as f32), -0.5);
                     let weight = weight_x * weight_y;
                     let (sr, sg, sb) = unpack_rgb(src[idx]);
 
-                    r += sr as f32 * weight;
-                    g += sg as f32 * weight;
-                    b += sb as f32 * weight;
+                    r += (sr as f32) * weight;
+                    g += (sg as f32) * weight;
+                    b += (sb as f32) * weight;
                     total_weight += weight;
                 }
             }
@@ -107,11 +107,12 @@ fn repack(
 fn compute_brightness(dst: &mut [u32], src: &[u32]) {
     std::iter::zip(dst.iter_mut(), src.iter()).for_each(|(dst, src)| {
         let (r, g, b) = unpack_rgb(*src);
-        let brightness = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        let brightness = 0.299 * (r as f32) + 0.587 * (g as f32) + 0.114 * (b as f32);
         *dst = brightness as u32;
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bimodal_luma_cluster(
     dst: &mut [u32],
     palette: &mut [u32],
@@ -140,7 +141,7 @@ fn bimodal_luma_cluster(
                 let m = l + (r - l) / 2;
                 let mut count = 0;
                 for brightness in luma {
-                    if *brightness <= m as u32 {
+                    if *brightness <= (m as u32) {
                         count += 1;
                     }
                 }
@@ -180,7 +181,7 @@ fn bimodal_luma_cluster(
                     cnt2 = cnt1;
                 }
                 _ => {}
-            };
+            }
 
             sum2.0 /= cnt2;
             sum2.1 /= cnt2;
@@ -249,7 +250,7 @@ fn get_ascii_string(dst: &mut [u32], src: &[u32], term_width: u32, term_height: 
     for y in 0..term_height {
         for x in 0..term_width {
             let idx = (y * term_width + x) as usize;
-            let base = (idx as u32 * ASCII_TABLE_SIZE * 2) as usize;
+            let base = ((idx as u32) * ASCII_TABLE_SIZE * 2) as usize;
             let mut max_similarity = 0;
             let mut max_idx = 0;
             for k in 0..ASCII_TABLE_SIZE * 2 {

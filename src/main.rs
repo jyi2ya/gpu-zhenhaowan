@@ -41,7 +41,7 @@ mod gpu {
 
     #[cube]
     fn pack_rgb(r: u32, g: u32, b: u32) -> u32 {
-        b << PACK_B_OFFSET | g << PACK_G_OFFSET | r << PACK_R_OFFSET
+        (b << PACK_B_OFFSET) | (g << PACK_G_OFFSET) | (r << PACK_R_OFFSET)
     }
 
     #[cube]
@@ -79,11 +79,11 @@ mod gpu {
             terminate!();
         }
 
-        let x_ratio = src_width as f32 / dst_width as f32;
-        let y_ratio = src_height as f32 / dst_height as f32;
+        let x_ratio = (src_width as f32) / (dst_width as f32);
+        let y_ratio = (src_height as f32) / (dst_height as f32);
 
-        let src_x = x as f32 * x_ratio;
-        let src_y = y as f32 * y_ratio;
+        let src_x = (x as f32) * x_ratio;
+        let src_y = (y as f32) * y_ratio;
 
         let x_floor = f32::floor(src_x) as i32;
         let y_floor = f32::floor(src_y) as i32;
@@ -96,18 +96,18 @@ mod gpu {
 
         for i in -1..3 {
             for j in -1..3 {
-                let px = i32::clamp(x_floor + i, 0, src_width as i32 - 1) as u32;
-                let py = i32::clamp(y_floor + j, 0, src_height as i32 - 1) as u32;
+                let px = i32::clamp(x_floor + i, 0, (src_width as i32) - 1) as u32;
+                let py = i32::clamp(y_floor + j, 0, (src_height as i32) - 1) as u32;
 
                 let idx = py * src_width + px;
-                let weight_x = cubic_weight(src_x - (x_floor + i) as f32, -0.5);
-                let weight_y = cubic_weight(src_y - (y_floor + j) as f32, -0.5);
+                let weight_x = cubic_weight(src_x - ((x_floor + i) as f32), -0.5);
+                let weight_y = cubic_weight(src_y - ((y_floor + j) as f32), -0.5);
                 let weight = weight_x * weight_y;
                 let (sr, sg, sb) = unpack_rgb(src[idx]);
 
-                r += sr as f32 * weight;
-                g += sg as f32 * weight;
-                b += sb as f32 * weight;
+                r += (sr as f32) * weight;
+                g += (sg as f32) * weight;
+                b += (sb as f32) * weight;
                 total_weight += weight;
             }
         }
@@ -232,7 +232,7 @@ mod gpu {
         sum1_1 /= cnt1;
         sum1_2 /= cnt1;
 
-        (for i in 0..4 {
+        for i in 0..4 {
             let mut bits = 0;
             for j in 0..32 {
                 let bit = if brightness[idx * px_per_img + i * 32 + j] <= median {
@@ -243,7 +243,7 @@ mod gpu {
                 bits |= bit << j;
             }
             dst[idx * 4 + i] = bits;
-        });
+        }
 
         // sum1: 暗色部 sum2: 亮色部
         palette[idx * 2] = pack_rgb(sum1_0, sum1_1, sum1_2);
@@ -260,7 +260,7 @@ mod gpu {
 
         let idx = y * width + x;
         let (r, g, b) = unpack_rgb(src[idx]);
-        let brightness = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        let brightness = 0.299 * (r as f32) + 0.587 * (g as f32) + 0.114 * (b as f32);
         dst[idx] = brightness as u32;
     }
 
@@ -268,10 +268,10 @@ mod gpu {
     fn count_zeros(x: u32) -> u32 {
         let x = x - ((x >> 1) & 0x55555555);
         let x = (x & 0x33333333) + ((x >> 2) & 0x33333333);
-        let x = (x + (x >> 4)) & 0x0F0F0F0F;
+        let x = (x + (x >> 4)) & 0x0f0f0f0f;
         let x = x + (x >> 8);
         let x = x + (x >> 16);
-        let ones = x & 0x0000003F;
+        let ones = x & 0x0000003f;
 
         32 - ones
     }
@@ -331,7 +331,7 @@ fn pack_rgb(r: u8, g: u8, b: u8) -> u32 {
     let r = r as u32;
     let g = g as u32;
     let b = b as u32;
-    b << PACK_B_OFFSET | g << PACK_G_OFFSET | r << PACK_R_OFFSET
+    (b << PACK_B_OFFSET) | (g << PACK_G_OFFSET) | (r << PACK_R_OFFSET)
 }
 
 fn unpack_rgb(packed: u32) -> (u8, u8, u8) {
@@ -488,23 +488,23 @@ mod edge {
         for i in 1..256 {
             cumulative_sum[i] = cumulative_sum[i - 1] + hist[i];
         }
-        let sum_total: u32 = hist.iter().enumerate().map(|(i, &v)| i as u32 * v).sum();
+        let sum_total: u32 = hist.iter().enumerate().map(|(i, &v)| (i as u32) * v).sum();
         let mut max_sigma = 0.0;
         let mut threshold = 0u8;
         for t in 1u8..255 {
-            let w0 = cumulative_sum[usize::from(t)] as f64 / total_pixels;
-            let w1 = (cumulative_sum[255] - cumulative_sum[usize::from(t)]) as f64 / total_pixels;
+            let w0 = (cumulative_sum[usize::from(t)] as f64) / total_pixels;
+            let w1 = ((cumulative_sum[255] - cumulative_sum[usize::from(t)]) as f64) / total_pixels;
             if w0 == 0.0 || w1 == 0.0 {
                 continue;
             }
             let sum_w0: u32 = hist[..usize::from(t)]
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| i as u32 * v)
+                .map(|(i, &v)| (i as u32) * v)
                 .sum();
-            let u0 = sum_w0 as f64 / w0;
+            let u0 = (sum_w0 as f64) / w0;
             let sum_w1 = sum_total - sum_w0;
-            let u1 = sum_w1 as f64 / w1;
+            let u1 = (sum_w1 as f64) / w1;
             let sigma = w0 * w1 * (u1 - u0).powi(2);
             if sigma > max_sigma {
                 max_sigma = sigma;
@@ -521,7 +521,7 @@ mod edge {
             hist[i] = (hist[i - 1] + hist[i] * 2 + hist[i + 1]) / 4;
         }
 
-        let th_otsu = f32::from(otsu_threshold(&hist));
+        let th_otsu = f32::from(otsu_threshold(hist));
 
         let th1 = th_otsu * 0.7;
         let th2 = th_otsu * 1.1;
@@ -745,7 +745,7 @@ mod edge {
             // 迭代次数可调
             while n < 5 {
                 term = -term * x2;
-                sum += term / (2 * n + 1) as f32;
+                sum += term / ((2 * n + 1) as f32);
                 n += 1;
             }
             sum
@@ -758,14 +758,14 @@ mod edge {
             } else if x < 0.0 {
                 let at = atan(y / x);
                 if y >= 0.0 {
-                    at + 3.141592653589793
+                    at + std::f32::consts::PI
                 } else {
-                    at - 3.141592653589793
+                    at - std::f32::consts::PI
                 }
             } else if y > 0.0 {
-                f32::new(1.5707963267948966)
+                f32::new(std::f32::consts::FRAC_PI_2)
             } else if y < 0.0 {
-                f32::new(-1.5707963267948966)
+                -f32::new(std::f32::consts::FRAC_PI_2)
             } else {
                 f32::new(0.0)
             }
@@ -793,8 +793,8 @@ mod edge {
             for ky in 0..3 {
                 for kx in 0..3 {
                     let idx = (y + ky - 1) * width + (x + kx - 1);
-                    gx += blurred[idx] as i32 * sobel_x[ky * 3 + kx];
-                    gy += blurred[idx] as i32 * sobel_y[ky * 3 + kx];
+                    gx += (blurred[idx] as i32) * sobel_x[ky * 3 + kx];
+                    gy += (blurred[idx] as i32) * sobel_y[ky * 3 + kx];
                 }
             }
 
@@ -802,6 +802,7 @@ mod edge {
             directions[idx] = atan2(gy as f32, gx as f32);
         }
 
+        #[allow(unused_assignments)]
         #[cube(launch)]
         pub fn non_maximum_suppression(
             suppressed: &mut Array<u32>,
@@ -826,7 +827,7 @@ mod edge {
             let mut dy2 = 0i32;
 
             // 量化方向到0°,45°,90°,135°
-            if angle < -3.0 * std::f32::consts::PI / 8.0 {
+            if angle < (-3.0 * std::f32::consts::PI) / 8.0 {
                 dx1 = 1;
                 dy1 = 0;
                 dx2 = -1;
@@ -841,7 +842,7 @@ mod edge {
                 dy1 = 0;
                 dx2 = -1;
                 dy2 = 0;
-            } else if angle < 3.0 * std::f32::consts::PI / 8.0 {
+            } else if angle < (3.0 * std::f32::consts::PI) / 8.0 {
                 dx1 = -1;
                 dy1 = 1;
                 dx2 = 1;
@@ -851,12 +852,12 @@ mod edge {
                 dy1 = 1;
                 dx2 = 0;
                 dy2 = -1;
-            };
+            }
 
-            let neighbor1 =
-                gradients[i32::max((y as i32 + dy1) * width as i32 + (x as i32 + dx1), 0) as u32];
-            let neighbor2 =
-                gradients[i32::max((y as i32 + dy2) * width as i32 + (x as i32 + dx2), 0) as u32];
+            let neighbor1 = gradients
+                [i32::max(((y as i32) + dy1) * (width as i32) + ((x as i32) + dx1), 0) as u32];
+            let neighbor2 = gradients
+                [i32::max(((y as i32) + dy2) * (width as i32) + ((x as i32) + dx2), 0) as u32];
 
             if grad >= neighbor1 && grad >= neighbor2 {
                 suppressed[idx] = grad as u32;
@@ -902,7 +903,7 @@ mod edge {
                 for ky in -1..=1 {
                     for kx in -1..=1 {
                         if ky != 0 || kx != 0 {
-                            let nidx = (y as i32 + ky) * width as i32 + (x as i32 + kx);
+                            let nidx = ((y as i32) + ky) * (width as i32) + ((x as i32) + kx);
                             if edges[nidx as u32] == 255 {
                                 edges[idx] = 255;
                                 break;
@@ -969,7 +970,7 @@ mod edge {
                 ArrayArg::from_raw_parts::<i32>(&sobel_y, 9, 1),
                 ScalarArg::new(width),
                 ScalarArg::new(height),
-            )
+            );
         }
 
         // // 2. 计算梯度
@@ -1039,6 +1040,7 @@ mod edge {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn render<RT: cubecl::prelude::Runtime>(
     client: &cubecl::client::ComputeClient<RT::Server, RT::Channel>,
     data: &[u8],
@@ -1057,7 +1059,7 @@ async fn render<RT: cubecl::prelude::Runtime>(
 
     let edges = {
         let single_channel_image =
-            client.empty(size_of::<u32>() * (resized_width * resized_height) as usize);
+            client.empty(size_of::<u32>() * ((resized_width * resized_height) as usize));
         unsafe {
             gpu::compute_brightness::launch::<RT>(
                 client,
@@ -1087,7 +1089,7 @@ async fn render<RT: cubecl::prelude::Runtime>(
                 ArrayArg::from_raw_parts::<u32>(&hist, len as usize, 1),
                 ArrayArg::from_raw_parts::<u32>(&single_channel_image, len as usize, 1),
                 ScalarArg::new(len),
-            )
+            );
         }
         let mut hist = u32::from_bytes(&client.read_one_async(hist.binding()).await).to_owned();
         let (canny_low, canny_high) = edge::otsu_thresholding(&mut hist);
@@ -1162,7 +1164,8 @@ async fn render<RT: cubecl::prelude::Runtime>(
 
         let repacked_width = resized_width;
         let repacked_height = resized_height;
-        let repacked = client.empty(size_of::<u32>() * (repacked_width * repacked_height) as usize);
+        let repacked =
+            client.empty(size_of::<u32>() * ((repacked_width * repacked_height) as usize));
         unsafe {
             gpu::repack::launch::<RT>(
                 client,
@@ -1192,7 +1195,7 @@ async fn render<RT: cubecl::prelude::Runtime>(
         // let _t = timer("cluster");
 
         let brightness =
-            client.empty(size_of::<u32>() * (repacked_height * repacked_width) as usize);
+            client.empty(size_of::<u32>() * ((repacked_height * repacked_width) as usize));
         unsafe {
             gpu::compute_brightness::launch::<RT>(
                 client,
@@ -1215,8 +1218,8 @@ async fn render<RT: cubecl::prelude::Runtime>(
 
         let clustered_width = resized_width;
         let clustered_height = resized_height;
-        let clustered = client.empty(size_of::<u32>() * (term_width * term_height * 4) as usize);
-        let palette = client.empty(size_of::<u32>() * (term_width * term_height * 2) as usize);
+        let clustered = client.empty(size_of::<u32>() * ((term_width * term_height * 4) as usize));
+        let palette = client.empty(size_of::<u32>() * ((term_width * term_height * 2) as usize));
         unsafe {
             gpu::bimodal_luma_cluster::launch::<RT>(
                 client,
@@ -1255,7 +1258,7 @@ async fn render<RT: cubecl::prelude::Runtime>(
     let similarity = {
         // let _t = timer("similarity");
         let similarity = client
-            .empty(size_of::<u32>() * (term_width * term_height * ASCII_TABLE_SIZE * 2) as usize);
+            .empty(size_of::<u32>() * ((term_width * term_height * ASCII_TABLE_SIZE * 2) as usize));
         unsafe {
             gpu::calc_similarity::launch::<RT>(
                 client,
@@ -1281,7 +1284,7 @@ async fn render<RT: cubecl::prelude::Runtime>(
     };
 
     let term = {
-        let term = client.empty(size_of::<u32>() * (term_width * term_height) as usize);
+        let term = client.empty(size_of::<u32>() * ((term_width * term_height) as usize));
         unsafe {
             gpu::get_ascii_string::launch::<RT>(
                 client,
@@ -1322,17 +1325,13 @@ fn screen(term: Vec<u32>, palette: Vec<u32>, term_width: u32, term_height: u32) 
                 (dark, bright)
             };
 
-            let chr = char::from(((term[idx] / 2) + ASCII_START) as u8);
+            let chr = char::from((term[idx] / 2 + ASCII_START) as u8);
 
             let (fr, fg, fb) = unpack_rgb(fg_color);
             let (br, bg, bb) = unpack_rgb(bg_color);
 
             output.push_str(
-                format!(
-                    "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m{}",
-                    fr, fg, fb, br, bg, bb, chr
-                )
-                .as_str(),
+                format!("\x1b[38;2;{fr};{fg};{fb}m\x1b[48;2;{br};{bg};{bb}m{chr}").as_str(),
             );
 
             idx += 1;
@@ -1350,49 +1349,56 @@ async fn main() -> anyhow::Result<()> {
     println!("Generated {} bytes of bitmap data", bitmap_data.len());
 
     let (term_width, term_height) = crossterm::terminal::size()?;
-    let term_width = term_width as u32 - 2;
-    let term_height = term_height as u32 - 2;
+    let term_width = (term_width as u32) - 2;
+    let term_height = (term_height as u32) - 2;
 
     let char_width = 8;
     let char_height = 16;
 
     let (tx, rx) = async_channel::bounded::<compio::runtime::Task<Result<_, _>>>(1);
 
-    compio::runtime::spawn(async move {
-        let mut frames_rendered = 0;
-        let mut frames_dropped = 0;
-        let start = std::time::Instant::now();
-        let mut handles = Vec::new();
-        while let Ok(finished) = rx.recv().await {
-            handles.push(finished);
-            if handles.len() > 30 {
-                let _ = handles.remove(0);
-                frames_dropped += 1;
-            }
-
-            if rx.is_empty() {
-                if let Some(finished) = handles.iter().enumerate().find(|(_idx, task)| task.is_finished()).map(|(idx, _task)| idx) {
-                    let mut rest = handles.split_off(finished);
-                    let finished = rest.remove(0);
-                    frames_dropped += handles.len();
-                    handles = rest;
-
-                    let (term, palette) = finished.await.unwrap();
-                    let now = std::time::Instant::now();
-                    let duration = (now - start).as_secs_f64();
-                    let screen = screen(term, palette, term_width, term_height);
-                    let content = format!(
-                        "{screen}ok, {duration:.2} secs, {frames_rendered} frames, {frames_dropped} dropped, {:.2}/{:.2} fps",
-                        frames_rendered as f64 / duration,
-                        (frames_rendered + frames_dropped) as f64 / duration,
-                    );
-                    compio::fs::stdout().write_all(content).await.unwrap();
-                    frames_rendered += 1;
+    compio::runtime
+        ::spawn(async move {
+            let mut frames_rendered = 0;
+            let mut frames_dropped = 0;
+            let start = std::time::Instant::now();
+            let mut handles = Vec::new();
+            while let Ok(finished) = rx.recv().await {
+                handles.push(finished);
+                if handles.len() > 30 {
+                    drop(handles.remove(0));
+                    frames_dropped += 1;
                 }
 
+                if rx.is_empty() {
+                    if
+                        let Some(finished) = handles
+                            .iter()
+                            .enumerate()
+                            .find(|(_idx, task)| task.is_finished())
+                            .map(|(idx, _task)| idx)
+                    {
+                        let mut rest = handles.split_off(finished);
+                        let finished = rest.remove(0);
+                        frames_dropped += handles.len();
+                        handles = rest;
+
+                        let (term, palette) = finished.await.unwrap();
+                        let now = std::time::Instant::now();
+                        let duration = (now - start).as_secs_f64();
+                        let screen = screen(term, palette, term_width, term_height);
+                        let content = format!(
+                            "{screen}ok, {duration:.2} secs, {frames_rendered} frames, {frames_dropped} dropped, {:.2}/{:.2} fps",
+                            (frames_rendered as f64) / duration,
+                            ((frames_rendered + frames_dropped) as f64) / duration
+                        );
+                        compio::fs::stdout().write_all(content).await.unwrap();
+                        frames_rendered += 1;
+                    }
+                }
             }
-        }
-    }).detach();
+        })
+        .detach();
 
     let mut stream =
         VideoStream::open(&file, term_width * char_width, term_height * char_height).unwrap();
